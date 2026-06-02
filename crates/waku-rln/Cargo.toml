@@ -10,6 +10,6 @@ authors.workspace = true
 
 [dependencies]
 waku-core = { workspace = true }
-# Milestone 2: rln = { workspace = true }  (PIN to nwaku's vendored zerokit version!)
-#              alloy = { workspace = true, features = ["provider-http", "contract"] }
-#              tokio, tracing
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rln = { workspace = true }

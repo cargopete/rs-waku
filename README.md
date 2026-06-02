@@ -45,7 +45,7 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 | `waku-discv5` | 33/WAKU2-DISCV5 + EIP-1459 DNS | ✅ done |
 | `waku-node` | composition / swarm driver / config | 🟡 M1 (relay+metadata+discv5) |
 | `wakunode` | node binary (nwaku-style CLI) | 🟡 M1 |
-| `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | ⬜ M2 |
+| `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | 🟡 proofs done |
 | `waku-store` | 13/WAKU2-STORE v3 + Store-Sync | ⬜ M3 |
 | `waku-filter` | 12/WAKU2-FILTER v2 | ⬜ M4 |
 | `waku-lightpush` | 19/WAKU2-LIGHTPUSH v3 | ⬜ M4 |
@@ -77,7 +77,7 @@ Each milestone is gated by an interop test against a live nwaku node (in the
   real nwaku-produced hash vector matched against ours.
 
 **Milestone 2 — RLN-Relay** (the routing protocol of TWN)
-- [ ] zerokit `rln` integration: proof gen/verify (Groth16/BN254/Poseidon).
+- [x] zerokit `rln` (2.0.x) integration: identities, membership tree, RLN-V2 proof gen/verify (Groth16/BN254/Poseidon, depth-20), tamper + stale-root tests.
 - [ ] Keystore (WAKU-RLN-KEYSTORE format).
 - [ ] On-chain group manager (`alloy`): register rate-commitment, event-sync the tree.
 - [ ] Per-epoch nullifier tracking (double-signaling detection).
