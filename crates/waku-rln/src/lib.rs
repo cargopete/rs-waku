@@ -5,10 +5,11 @@
 //! bundled `arkzkey` + iden3 witness graph — no `protoc`, no FFI, no network).
 //! Using zerokit directly keeps proofs byte-compatible with nwaku and js-rln.
 //!
-//! This module currently covers the proof primitives: identities, membership
-//! registration into the Merkle tree, proof generation, and verification. Still
-//! to come for full M2: the WAKU-RLN-KEYSTORE format, the on-chain group manager
-//! (`alloy`), per-epoch nullifier tracking, and the gossipsub validator seam.
+//! Covered: identities, membership registration into the Merkle tree, proof
+//! generation/verification, and per-epoch nullifier tracking with double-signal
+//! detection + Shamir secret recovery. Still to come for full M2: the
+//! WAKU-RLN-KEYSTORE format, the on-chain group manager (`alloy`), and the
+//! gossipsub validator seam (with the nwaku `rate_limit_proof` wire format).
 //!
 //! ⚠ INTEROP CAVEATS (matter for nwaku byte-compatibility, not self-roundtrip):
 //! - `x = hash_to_field_le(signal)` — endianness and the exact signal bytes must
@@ -18,9 +19,11 @@
 //!   nwaku's (`waku/waku_rln_relay`).
 //! - Pin the `rln` crate to the exact zerokit version nwaku vendors.
 
+use std::collections::HashMap;
+
 use rln::prelude::{
-    hash_to_field_le, keygen, poseidon_hash, Fr, IdSecret, Proof, RLNProofValues, RLNWitnessInput,
-    DEFAULT_TREE_DEPTH, RLN,
+    compute_id_secret, fr_to_bytes_le, hash_to_field_le, keygen, poseidon_hash, Fr, IdSecret,
+    Proof, RLNProofValues, RLNWitnessInput, DEFAULT_TREE_DEPTH, RLN,
 };
 use thiserror::Error;
 
@@ -68,6 +71,91 @@ pub struct RlnProof {
     proof: Proof,
     values: RLNProofValues,
     x: Fr,
+}
+
+impl RlnProof {
+    /// `external_nullifier = Poseidon(epoch, rln_identifier)` — identifies the epoch.
+    pub fn external_nullifier(&self) -> Fr {
+        *self.values.external_nullifier()
+    }
+
+    /// The internal nullifier — equal for the same (identity, epoch, message_id).
+    pub fn nullifier(&self) -> Fr {
+        *self.values.nullifier()
+    }
+
+    /// The Shamir share `(x, y)` on the secret-sharing line for this message.
+    pub fn share(&self) -> (Fr, Fr) {
+        (*self.values.x(), *self.values.y())
+    }
+
+    /// The Merkle root the proof was generated against.
+    pub fn root(&self) -> Fr {
+        *self.values.root()
+    }
+}
+
+/// Outcome of observing a proof's nullifier within an epoch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NullifierOutcome {
+    /// First sighting of this `(epoch, nullifier)` — the message is original.
+    Ok,
+    /// The exact same share was seen before — a replay of the same message.
+    Duplicate,
+    /// The nullifier reappeared with a *different* share: the publisher exceeded
+    /// their rate limit (double-signaling), so their identity secret is recovered.
+    DoubleSignaling { recovered_secret: Fr },
+}
+
+/// Map of internal-nullifier bytes → the Shamir share `(x, y)` first seen for it.
+type EpochNullifiers = HashMap<Vec<u8>, (Fr, Fr)>;
+
+/// Tracks seen nullifiers per epoch to detect double-signaling (RFC 32/58).
+///
+/// Keyed by `external_nullifier` (the epoch) then by the internal nullifier; a
+/// repeat nullifier with a different Shamir share reveals the identity secret.
+#[derive(Default)]
+pub struct NullifierLog {
+    seen: HashMap<Vec<u8>, EpochNullifiers>,
+}
+
+impl NullifierLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a proof's nullifier and classify it.
+    pub fn observe(&mut self, proof: &RlnProof) -> Result<NullifierOutcome, RlnError> {
+        let epoch_key = fr_to_bytes_le(&proof.external_nullifier());
+        let nullifier_key = fr_to_bytes_le(&proof.nullifier());
+        let (x, y) = proof.share();
+
+        let bucket = self.seen.entry(epoch_key).or_default();
+        match bucket.get(&nullifier_key) {
+            None => {
+                bucket.insert(nullifier_key, (x, y));
+                Ok(NullifierOutcome::Ok)
+            }
+            Some(&(px, py)) if px == x && py == y => Ok(NullifierOutcome::Duplicate),
+            Some(&prev_share) => {
+                let secret = compute_id_secret(prev_share, (x, y))
+                    .map_err(|e| RlnError::Rln(e.to_string()))?;
+                Ok(NullifierOutcome::DoubleSignaling {
+                    recovered_secret: *secret,
+                })
+            }
+        }
+    }
+
+    /// Forget tracking for an epoch that has aged out of the validity window.
+    pub fn forget_epoch(&mut self, external_nullifier: &Fr) {
+        self.seen.remove(&fr_to_bytes_le(external_nullifier));
+    }
+
+    /// Number of epochs currently tracked.
+    pub fn tracked_epochs(&self) -> usize {
+        self.seen.len()
+    }
 }
 
 /// An RLN-Relay context: the zkey + witness graph + the membership Merkle tree.
@@ -185,5 +273,56 @@ mod tests {
         let bob = RlnIdentity::generate(100);
         relay.register(&bob).expect("register bob");
         assert!(!relay.verify(&proof).expect("verify stale"));
+    }
+
+    #[test]
+    fn double_signaling_recovers_the_identity_secret() {
+        let mut relay = RlnRelay::new().expect("rln init");
+        let identity = RlnIdentity::generate(100);
+        let index = relay.register(&identity).expect("register");
+        let mut log = NullifierLog::new();
+
+        // Same epoch + same message-id slot, two DIFFERENT signals: same
+        // nullifier, different share → the rate limit is broken.
+        let p1 = relay.prove(&identity, index, b"message one", 5, 0).unwrap();
+        let p2 = relay.prove(&identity, index, b"message two", 5, 0).unwrap();
+
+        assert_eq!(log.observe(&p1).unwrap(), NullifierOutcome::Ok);
+        match log.observe(&p2).unwrap() {
+            NullifierOutcome::DoubleSignaling { recovered_secret } => {
+                assert_eq!(
+                    recovered_secret, *identity.secret,
+                    "must recover the secret"
+                );
+            }
+            other => panic!("expected double-signaling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_message_ids_within_limit_are_ok() {
+        let mut relay = RlnRelay::new().expect("rln init");
+        let identity = RlnIdentity::generate(100);
+        let index = relay.register(&identity).expect("register");
+        let mut log = NullifierLog::new();
+
+        // Different message-id slots in one epoch → distinct nullifiers → all Ok.
+        let p0 = relay.prove(&identity, index, b"a", 9, 0).unwrap();
+        let p1 = relay.prove(&identity, index, b"b", 9, 1).unwrap();
+        assert_eq!(log.observe(&p0).unwrap(), NullifierOutcome::Ok);
+        assert_eq!(log.observe(&p1).unwrap(), NullifierOutcome::Ok);
+        assert_eq!(log.tracked_epochs(), 1);
+    }
+
+    #[test]
+    fn replaying_the_same_message_is_a_duplicate() {
+        let mut relay = RlnRelay::new().expect("rln init");
+        let identity = RlnIdentity::generate(100);
+        let index = relay.register(&identity).expect("register");
+        let mut log = NullifierLog::new();
+
+        let proof = relay.prove(&identity, index, b"dup", 3, 0).unwrap();
+        assert_eq!(log.observe(&proof).unwrap(), NullifierOutcome::Ok);
+        assert_eq!(log.observe(&proof).unwrap(), NullifierOutcome::Duplicate);
     }
 }

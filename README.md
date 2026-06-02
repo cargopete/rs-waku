@@ -80,7 +80,7 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] zerokit `rln` (2.0.x) integration: identities, membership tree, RLN-V2 proof gen/verify (Groth16/BN254/Poseidon, depth-20), tamper + stale-root tests.
 - [ ] Keystore (WAKU-RLN-KEYSTORE format).
 - [ ] On-chain group manager (`alloy`): register rate-commitment, event-sync the tree.
-- [ ] Per-epoch nullifier tracking (double-signaling detection).
+- [x] Per-epoch nullifier tracking: double-signaling detection + Shamir identity-secret recovery (tested).
 - [ ] Wire as a gossipsub validator (`validate_messages()` → Accept/Reject/Ignore).
 - [ ] **Gate:** bidirectional RLN proof verification with nwaku on a shared chain.
 
