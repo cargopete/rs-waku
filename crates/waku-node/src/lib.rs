@@ -11,7 +11,9 @@
 
 pub mod runtime;
 
-pub use runtime::{spawn, Event, NodeConfig, NodeError, NodeHandle, WakuBehaviour};
+pub use runtime::{
+    spawn, DiscoverySettings, Event, NodeConfig, NodeError, NodeHandle, WakuBehaviour,
+};
 
 use waku_core::{NetworkPreset, TWN};
 

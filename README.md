@@ -33,7 +33,7 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 | `waku-metadata` | 66/WAKU2-METADATA | ✅ done |
 | `waku-enr` | 31/WAKU2-ENR (relay-shards codec) | ✅ done |
 | `waku-discv5` | 33/WAKU2-DISCV5 (DNS disc. pending) | 🟡 discv5 done |
-| `waku-node` | composition / swarm driver / config | 🟡 M1 (relay+identify+metadata) |
+| `waku-node` | composition / swarm driver / config | 🟡 M1 (relay+metadata+discv5) |
 | `wakunode` | node binary (nwaku-style CLI) | 🟡 M1 |
 | `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | ⬜ M2 |
 | `waku-store` | 13/WAKU2-STORE v3 + Store-Sync | ⬜ M3 |
@@ -59,8 +59,9 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] 66/WAKU2-METADATA: cluster/shard handshake; disconnect on cluster mismatch.
 - [x] 31/WAKU2-ENR: relay-shards (`rs`/`rsv`) codec.
 - [x] 33/WAKU2-DISCV5: Waku discv5 (sigp/discv5), ENR shards, cluster-filtered discovery.
-- [ ] Wire discv5 into the node (feed discovered peers to the swarm; link ENR↔libp2p via `multiaddrs`).
+- [x] Wire discv5 into the node: shared secp256k1 key, ENR→libp2p peer-id bridge, auto-dial discovered/bootstrap peers (end-to-end discover→dial→relay test).
 - [ ] EIP-1459 DNS discovery (enrtree TXT resolver) for bootstrap.
+- [ ] Expose discv5 flags on the `wakunode` CLI.
 - [ ] WSS / QUIC transports for browser interop.
 - [ ] **Gate:** join a live nwaku via the simulator; confirm we stay in-mesh
   (not pruned/penalized) and a real nwaku-produced hash vector matches ours.

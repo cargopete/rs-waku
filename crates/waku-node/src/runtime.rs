@@ -5,6 +5,8 @@
 //! event stream. This is the seam through which `waku-store`, `waku-rln`, the
 //! REST API, etc. will later attach.
 
+use std::collections::HashSet;
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -14,7 +16,11 @@ use libp2p::{gossipsub, identify, identity::Keypair, noise, tcp, yamux, Multiadd
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use waku_core::{deterministic_hash, MessageHash, ShardId, WakuMessage, TWN};
+use waku_discv5::{Discovery, DiscoveryConfig, Key as CombinedKey, WakuEnr};
 use waku_metadata::WakuMetadata;
+
+/// How often the discovery task runs a fresh discv5 query.
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The composed Waku network behaviour. Milestone 1 carries relay + identify +
 /// metadata; discv5, store, filter, … slot in as further fields.
@@ -37,6 +43,18 @@ pub enum NodeError {
     Command(String),
 }
 
+/// discv5 discovery settings for a node.
+pub struct DiscoverySettings {
+    /// UDP port for the discv5 service.
+    pub udp_port: u16,
+    /// Externally reachable IPv4 advertised in our ENR.
+    pub advertised_ip: Ipv4Addr,
+    /// libp2p TCP port advertised in our ENR (so peers can dial us).
+    pub advertised_tcp_port: u16,
+    /// Bootstrap ENRs to seed the DHT and dial immediately.
+    pub bootstrap: Vec<WakuEnr>,
+}
+
 /// Configuration for the libp2p swarm underlying a node.
 pub struct NodeConfig {
     pub keypair: Keypair,
@@ -46,17 +64,22 @@ pub struct NodeConfig {
     pub cluster_id: u16,
     /// Shards advertised in the metadata handshake.
     pub shards: Vec<u16>,
+    /// If set, run discv5 discovery and auto-dial discovered cluster peers.
+    pub discovery: Option<DiscoverySettings>,
 }
 
 impl NodeConfig {
-    /// Fresh ed25519 identity, no listen addresses, TWN cluster/shards.
+    /// Fresh secp256k1 identity (shared with discv5/ENR), no listen addresses,
+    /// TWN cluster/shards. secp256k1 matches nwaku's host-key choice and lets a
+    /// peer's libp2p id be recovered straight from its ENR.
     pub fn new() -> Self {
         Self {
-            keypair: Keypair::generate_ed25519(),
+            keypair: Keypair::generate_secp256k1(),
             listen_addrs: Vec::new(),
             idle_timeout: Duration::from_secs(60),
             cluster_id: TWN.cluster_id,
             shards: (0..TWN.shard_count).collect(),
+            discovery: None,
         }
     }
 
@@ -126,11 +149,18 @@ enum Command {
 pub struct NodeHandle {
     peer_id: PeerId,
     cmd_tx: mpsc::Sender<Command>,
+    discv5_enr: Option<WakuEnr>,
 }
 
 impl NodeHandle {
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// This node's discv5 ENR, if discovery is enabled. Hand it to other nodes
+    /// as a bootstrap entry.
+    pub fn discv5_enr(&self) -> Option<WakuEnr> {
+        self.discv5_enr.clone()
     }
 
     pub async fn subscribe(&self, shard: ShardId) -> Result<(), NodeError> {
@@ -205,7 +235,9 @@ fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
 }
 
 /// Build the swarm, start listening, and spawn the driver task.
-pub async fn spawn(config: NodeConfig) -> Result<(NodeHandle, mpsc::Receiver<Event>), NodeError> {
+pub async fn spawn(
+    mut config: NodeConfig,
+) -> Result<(NodeHandle, mpsc::Receiver<Event>), NodeError> {
     let mut swarm = build_swarm(&config)?;
     let peer_id = *swarm.local_peer_id();
     let local_cluster = config.cluster_id as u32;
@@ -222,7 +254,96 @@ pub async fn spawn(config: NodeConfig) -> Result<(NodeHandle, mpsc::Receiver<Eve
 
     tokio::spawn(run(swarm, cmd_rx, evt_tx, local_cluster, local_meta));
 
-    Ok((NodeHandle { peer_id, cmd_tx }, evt_rx))
+    // Optionally start discv5 discovery, sharing the node's secp256k1 key.
+    let mut discv5_enr = None;
+    if let Some(settings) = config.discovery.take() {
+        let key = keypair_to_combined(&config.keypair)?;
+        let mut dcfg =
+            DiscoveryConfig::new(settings.udp_port).with_cluster(config.cluster_id, config.shards);
+        dcfg.key = Some(key);
+        dcfg.external_ip = Some(settings.advertised_ip);
+        dcfg.tcp_port = Some(settings.advertised_tcp_port);
+        dcfg.bootstrap = settings.bootstrap.clone();
+
+        let mut discovery = Discovery::new(dcfg).map_err(|e| NodeError::Build(e.to_string()))?;
+        discovery
+            .start()
+            .await
+            .map_err(|e| NodeError::Build(e.to_string()))?;
+        discv5_enr = Some(discovery.local_enr());
+
+        tokio::spawn(discovery_loop(
+            discovery,
+            settings.bootstrap,
+            cmd_tx.clone(),
+        ));
+    }
+
+    Ok((
+        NodeHandle {
+            peer_id,
+            cmd_tx,
+            discv5_enr,
+        },
+        evt_rx,
+    ))
+}
+
+/// Convert the node's secp256k1 libp2p key into a discv5 [`CombinedKey`].
+fn keypair_to_combined(keypair: &Keypair) -> Result<CombinedKey, NodeError> {
+    let kp = keypair
+        .clone()
+        .try_into_secp256k1()
+        .map_err(|_| NodeError::Build("node identity must be secp256k1 for discv5".into()))?;
+    let mut secret = kp.secret().to_bytes();
+    CombinedKey::secp256k1_from_bytes(&mut secret).map_err(|e| NodeError::Build(e.to_string()))
+}
+
+/// Dial bootstrap peers, then periodically discover and dial new cluster peers.
+async fn discovery_loop(
+    discovery: Discovery,
+    bootstrap: Vec<WakuEnr>,
+    cmd_tx: mpsc::Sender<Command>,
+) {
+    let mut known: HashSet<PeerId> = HashSet::new();
+
+    for enr in &bootstrap {
+        if let Some(peer) = waku_discv5::enr_to_dialable(enr) {
+            dial_discovered(&cmd_tx, &mut known, peer).await;
+        }
+    }
+
+    loop {
+        tokio::time::sleep(DISCOVERY_INTERVAL).await;
+        if cmd_tx.is_closed() {
+            break;
+        }
+        match discovery.discover_dialable().await {
+            Ok(peers) => {
+                for peer in peers {
+                    dial_discovered(&cmd_tx, &mut known, peer).await;
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "discovery query failed"),
+        }
+    }
+}
+
+async fn dial_discovered(
+    cmd_tx: &mpsc::Sender<Command>,
+    known: &mut HashSet<PeerId>,
+    peer: waku_discv5::DiscoveredPeer,
+) {
+    if !known.insert(peer.peer_id) {
+        return;
+    }
+    tracing::info!(peer = %peer.peer_id, "auto-dialing discovered peer");
+    for addr in peer.addrs {
+        let (reply, _rx) = oneshot::channel();
+        if cmd_tx.send(Command::Dial { addr, reply }).await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn run(
