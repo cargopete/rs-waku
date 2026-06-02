@@ -1,0 +1,14 @@
+[package]
+name = "waku-store"
+description = "13/WAKU2-STORE v3 + Store-Sync (Milestone 3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+waku-core = { workspace = true }
+async-trait = { workspace = true }
+# Milestone 3: sqlx = { workspace = true, features = ["postgres"] }, tokio, prost

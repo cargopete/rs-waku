@@ -1,0 +1,13 @@
+[package]
+name = "waku-relay"
+description = "11/WAKU2-RELAY — gossipsub behaviour with the Waku message-id (Milestone 1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+waku-core = { workspace = true }
+# Milestone 1: libp2p = { workspace = true, features = ["gossipsub", "noise", "yamux", "tcp", "websocket", "quic", "tokio", "macros"] }

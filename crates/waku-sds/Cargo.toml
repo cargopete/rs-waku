@@ -1,0 +1,12 @@
+[package]
+name = "waku-sds"
+description = "SDS (Scalable Data Sync) — app-layer e2e reliability (optional, Milestone 6)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+waku-core = { workspace = true }

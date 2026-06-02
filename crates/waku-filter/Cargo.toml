@@ -1,0 +1,13 @@
+[package]
+name = "waku-filter"
+description = "12/WAKU2-FILTER v2 — filter-subscribe / filter-push (Milestone 4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+waku-core = { workspace = true }
+# Milestone 4: libp2p (request-response), prost, tokio

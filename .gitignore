@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local secrets / RLN keystores — never commit
+.env
+*.keystore
+keystore.json
+rln_tree.db*
+
+# SQLite store backends
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Editor noise
+.DS_Store
+.idea/
+.vscode/

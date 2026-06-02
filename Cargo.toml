@@ -1,0 +1,94 @@
+# rs-waku — a native-Rust Waku ("Logos Messaging") node.
+#
+# Workspace layout mirrors the architecture in the project plan: one crate per
+# Waku protocol, composed into `waku-node`, exposed by the `wakunode` binary.
+#
+# Dependency policy: every external crate is pinned ONCE here, in
+# [workspace.dependencies]. Individual crates opt in with `foo = { workspace = true }`
+# as their milestone comes online. This keeps the first build cheap and the pins
+# in one auditable place.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/waku-core",
+    "crates/waku-enr",
+    "crates/waku-discv5",
+    "crates/waku-relay",
+    "crates/waku-rln",
+    "crates/waku-store",
+    "crates/waku-filter",
+    "crates/waku-lightpush",
+    "crates/waku-peer-exchange",
+    "crates/waku-metadata",
+    "crates/waku-node",
+    "crates/waku-rest",
+    "crates/waku-sds",
+    "wakunode",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cargopete/rs-waku"
+authors = ["rs-waku contributors"]
+
+[workspace.dependencies]
+# --- internal crates (path deps) ---
+waku-core = { path = "crates/waku-core" }
+waku-enr = { path = "crates/waku-enr" }
+waku-discv5 = { path = "crates/waku-discv5" }
+waku-relay = { path = "crates/waku-relay" }
+waku-rln = { path = "crates/waku-rln" }
+waku-store = { path = "crates/waku-store" }
+waku-filter = { path = "crates/waku-filter" }
+waku-lightpush = { path = "crates/waku-lightpush" }
+waku-peer-exchange = { path = "crates/waku-peer-exchange" }
+waku-metadata = { path = "crates/waku-metadata" }
+waku-node = { path = "crates/waku-node" }
+waku-rest = { path = "crates/waku-rest" }
+waku-sds = { path = "crates/waku-sds" }
+
+# --- foundational / always-on ---
+thiserror = "2.0"
+prost = "0.14"
+sha2 = "0.11"
+hex = "0.4"
+tracing = "0.1"
+
+# --- async runtime + tooling ---
+tokio = { version = "1.43", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# --- networking (Milestone 1: relay, metadata, discovery) ---
+# libp2p bundles its own gossipsub/noise/yamux; pull only the features a crate needs.
+libp2p = { version = "0.56", default-features = false }
+# sigp/discv5 is used STANDALONE (Waku-isolated DHT), separate from libp2p's swarm.
+# Keep `enr` aligned with whatever `discv5` re-exports to avoid two enr crates.
+discv5 = "0.10"
+enr = "0.13"
+
+# --- RLN (Milestone 2) ---
+# CAVEAT: plan assumed rln 1.0.0; crates.io is now 2.0.x. RLN proofs are only
+# byte-compatible with the EXACT zerokit version nwaku vendors for the release we
+# target. Pin this to match nwaku's `vendor/zerokit` before trusting interop.
+rln = "2.0"
+alloy = { version = "2.0", default-features = false }
+
+# --- store (Milestone 3) ---
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+
+# --- REST API (Milestone 5) ---
+axum = "0.8"
+
+# --- metrics ---
+prometheus = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

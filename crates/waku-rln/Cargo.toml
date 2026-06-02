@@ -1,0 +1,15 @@
+[package]
+name = "waku-rln"
+description = "17/WAKU2-RLN-RELAY — RLN-V2 proofs via zerokit + on-chain membership (Milestone 2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+waku-core = { workspace = true }
+# Milestone 2: rln = { workspace = true }  (PIN to nwaku's vendored zerokit version!)
+#              alloy = { workspace = true, features = ["provider-http", "contract"] }
+#              tokio, tracing
