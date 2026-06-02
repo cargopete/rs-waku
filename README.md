@@ -5,11 +5,12 @@ feature parity with [nwaku](https://github.com/waku-org/nwaku) / go-waku by
 layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 `rust-libp2p`, `sigp/discv5`, and `zerokit`.
 
-> **Status: Milestone 1 in progress.** A runnable relay node exists: it stands
-> up a libp2p swarm, subscribes to the TWN shards, and relays `WakuMessage`s over
-> gossipsub with the correct Waku message-id and StrictNoSign. A two-node
-> loopback interop test passes. Metadata, discv5 and DNS discovery are next, then
-> the gate against a live nwaku node.
+> **Status: Milestone 1 nearly complete.** A relay node that *finds its own
+> peers*: it stands up a libp2p swarm, runs discv5, discovers cluster peers from a
+> bootstrap ENR, dials them, completes the metadata handshake, and relays
+> `WakuMessage`s over gossipsub with the correct Waku message-id and StrictNoSign.
+> Remaining before the live-nwaku gate: EIP-1459 DNS discovery and exposing discv5
+> on the CLI.
 
 ## What works today
 
@@ -17,12 +18,20 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
   message hash, content-topic parsing, autosharding, and the TWN preset. Unit-tested.
 - **`waku-relay`** — gossipsub v1.1 configured the Waku way: `message_id` = the
   RFC-14 hash, `ValidationMode::Anonymous` (StrictNoSign), go-libp2p mesh defaults.
-- **`waku-node`** — composes `relay + identify` into one `#[derive(NetworkBehaviour)]`
-  swarm driven by a single task; the rest of the app talks to it over command/event
-  channels (`subscribe` / `publish` / `dial`).
-- **`wakunode`** — a CLI (nwaku-style flags) that runs the above as a real relay node.
-- **Loopback interop test** — two nodes do a Noise handshake, form a gossipsub
-  mesh, exchange a message, and the received id equals the RFC-14 hash.
+- **`waku-metadata`** — 66/WAKU2-METADATA request/response (length-prefixed
+  protobuf); the node disconnects peers on a cluster-id mismatch.
+- **`waku-enr` + `waku-discv5`** — the ENR relay-shards codec (`rs`/`rsv`) and a
+  `sigp/discv5` wrapper that discovers peers filtered to our cluster and resolves
+  each ENR to a dialable libp2p address (secp256k1 ENR → libp2p peer-id bridge).
+- **`waku-node`** — composes `relay + identify + metadata` into one
+  `#[derive(NetworkBehaviour)]` swarm driven by a single task; talks to the app
+  over command/event channels (`subscribe` / `publish` / `dial`); optionally runs
+  discv5 and auto-dials discovered + bootstrap peers using a shared secp256k1 key.
+- **`wakunode`** — a CLI (nwaku-style flags) that runs the above as a relay node
+  (discv5 not yet exposed on the CLI; use `--staticnode` to connect peers).
+- **Interop tests** — a two-node gossipsub loopback (received id == RFC-14 hash),
+  a metadata cluster-mismatch handshake, a discv5 session, and an end-to-end
+  *discover → dial → relay* test seeded with only a peer's ENR.
 
 ## Workspace
 
