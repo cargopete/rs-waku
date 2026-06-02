@@ -5,10 +5,13 @@
 //! libp2p swarm, subscribes to the configured shards, dials any static peers,
 //! and relays. RLN/store/filter/lightpush land in later milestones.
 
+use std::net::Ipv4Addr;
+use std::str::FromStr;
+
 use clap::Parser;
 use libp2p::Multiaddr;
 use waku_core::{ShardId, TWN};
-use waku_node::{spawn, Event, NodeConfig};
+use waku_node::{spawn, DiscoverySettings, Event, NodeConfig, WakuEnr};
 
 /// rs-waku node (Logos Messaging) — native Rust.
 #[derive(Parser, Debug)]
@@ -22,7 +25,7 @@ struct Cli {
     #[arg(long = "shard")]
     shards: Vec<u16>,
 
-    /// TCP port to listen on (0 = ephemeral).
+    /// TCP port to listen on (0 = ephemeral; a fixed port is required for discv5).
     #[arg(long = "tcp-port", default_value_t = 60000)]
     tcp_port: u16,
 
@@ -37,6 +40,30 @@ struct Cli {
     /// Enable 17/WAKU2-RLN-RELAY (not yet implemented).
     #[arg(long = "rln-relay", default_value_t = false)]
     rln_relay: bool,
+
+    /// Enable 33/WAKU2-DISCV5 discovery.
+    #[arg(long = "discv5-discovery", default_value_t = false)]
+    discv5: bool,
+
+    /// UDP port for discv5.
+    #[arg(long = "discv5-udp-port", default_value_t = 9000)]
+    discv5_udp_port: u16,
+
+    /// Externally reachable IPv4 to advertise in our ENR.
+    #[arg(long = "ext-ip", default_value = "127.0.0.1")]
+    ext_ip: Ipv4Addr,
+
+    /// discv5 bootstrap node ENR (`enr:...`); repeatable.
+    #[arg(long = "discv5-bootstrap-node")]
+    bootstrap_enrs: Vec<String>,
+
+    /// Enable EIP-1459 DNS discovery.
+    #[arg(long = "dns-discovery", default_value_t = false)]
+    dns_discovery: bool,
+
+    /// enrtree:// URL for DNS discovery; repeatable. Defaults to the TWN tree.
+    #[arg(long = "dns-discovery-url")]
+    dns_discovery_urls: Vec<String>,
 }
 
 #[tokio::main]
@@ -65,11 +92,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let listen: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", cli.tcp_port).parse()?;
-    let config = NodeConfig::new()
+    let mut config = NodeConfig::new()
         .with_listen_addr(listen)
         .with_cluster(cli.cluster_id, shards.clone());
+
+    // Assemble discovery settings if any discovery mechanism was requested.
+    let want_discovery = cli.discv5 || cli.dns_discovery || !cli.bootstrap_enrs.is_empty();
+    if want_discovery {
+        if cli.tcp_port == 0 {
+            tracing::warn!("discv5 advertises --tcp-port; using 0 makes us undialable");
+        }
+        let bootstrap = cli
+            .bootstrap_enrs
+            .iter()
+            .filter_map(|s| match WakuEnr::from_str(s) {
+                Ok(enr) => Some(enr),
+                Err(e) => {
+                    tracing::warn!(enr = %s, error = %e, "ignoring invalid bootstrap ENR");
+                    None
+                }
+            })
+            .collect();
+        let dns_bootstrap = if cli.dns_discovery && cli.dns_discovery_urls.is_empty() {
+            vec![TWN.dns_discovery_enrtree.to_string()]
+        } else {
+            cli.dns_discovery_urls.clone()
+        };
+        config.discovery = Some(DiscoverySettings {
+            udp_port: cli.discv5_udp_port,
+            advertised_ip: cli.ext_ip,
+            advertised_tcp_port: cli.tcp_port,
+            bootstrap,
+            dns_bootstrap,
+        });
+    }
+
     let (node, mut events) = spawn(config).await?;
     tracing::info!(peer_id = %node.peer_id(), "rs-waku node started");
+    if let Some(enr) = node.discv5_enr() {
+        tracing::info!(enr = %enr.to_base64(), "local ENR (share me as a bootstrap node)");
+    }
 
     for shard in &shards {
         let s = ShardId::new(cli.cluster_id, *shard);
