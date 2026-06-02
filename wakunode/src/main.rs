@@ -65,7 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let listen: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", cli.tcp_port).parse()?;
-    let (node, mut events) = spawn(NodeConfig::new().with_listen_addr(listen)).await?;
+    let config = NodeConfig::new()
+        .with_listen_addr(listen)
+        .with_cluster(cli.cluster_id, shards.clone());
+    let (node, mut events) = spawn(config).await?;
     tracing::info!(peer_id = %node.peer_id(), "rs-waku node started");
 
     for shard in &shards {
@@ -98,6 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 Some(Event::PeerConnected(p)) => tracing::info!(peer = %p, "peer connected"),
                 Some(Event::PeerDisconnected(p)) => tracing::debug!(peer = %p, "peer disconnected"),
+                Some(Event::MetadataMismatch { peer, theirs }) => tracing::warn!(
+                    %peer, ?theirs, "disconnected peer: cluster mismatch",
+                ),
                 Some(Event::Listening(addr)) => tracing::info!(%addr, "listening"),
                 None => break,
             }

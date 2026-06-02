@@ -30,9 +30,9 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 |---|---|---|
 | `waku-core` | 14/WAKU2-MESSAGE, RFC-14 hash, sharding, presets | ✅ done |
 | `waku-relay` | 11/WAKU2-RELAY (gossipsub) | ✅ done (scoring TODO) |
-| `waku-node` | composition / swarm driver / config | 🟡 M1 (relay+identify) |
+| `waku-metadata` | 66/WAKU2-METADATA | ✅ done |
+| `waku-node` | composition / swarm driver / config | 🟡 M1 (relay+identify+metadata) |
 | `wakunode` | node binary (nwaku-style CLI) | 🟡 M1 |
-| `waku-metadata` | 66/WAKU2-METADATA | ⬜ M1 |
 | `waku-enr` | 31/WAKU2-ENR | ⬜ M1 |
 | `waku-discv5` | 33/WAKU2-DISCV5 + EIP-1459 DNS | ⬜ M1 |
 | `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | ⬜ M2 |
@@ -56,7 +56,7 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] 11/WAKU2-RELAY: gossipsub with Waku message-id + StrictNoSign.
 - [x] Shard subscribe / publish, command-and-event node runtime.
 - [x] Two-node loopback interop test.
-- [ ] 66/WAKU2-METADATA: cluster/shard handshake; disconnect on cluster mismatch.
+- [x] 66/WAKU2-METADATA: cluster/shard handshake; disconnect on cluster mismatch.
 - [ ] 31/WAKU2-ENR + 33/WAKU2-DISCV5: Waku-isolated discv5, shard filtering.
 - [ ] EIP-1459 DNS discovery (enrtree TXT resolver) for bootstrap.
 - [ ] WSS / QUIC transports for browser interop.

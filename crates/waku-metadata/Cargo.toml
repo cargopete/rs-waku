@@ -10,4 +10,7 @@ authors.workspace = true
 
 [dependencies]
 waku-core = { workspace = true }
-# Milestone 1: libp2p = { workspace = true, features = ["request-response"] }, prost
+prost = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+libp2p = { workspace = true, features = ["request-response"] }
