@@ -1,16 +1,191 @@
-//! # waku-discv5 — 33/WAKU2-DISCV5 + EIP-1459 DNS discovery
+//! # waku-discv5 — 33/WAKU2-DISCV5
 //!
-//! Two discovery mechanisms:
-//!   1. a Waku-isolated discv5 DHT (wraps `sigp/discv5`), with a Waku-specific
-//!      protocol id so we land in the Waku network, NOT Ethereum's, and shard
-//!      filtering via the ENR `rs` field;
-//!   2. an EIP-1459 DNS-discovery client (the Merkle-tree TXT resolver) for
-//!      bootstrap — this piece is NOT provided by `sigp/discv5`.
+//! Wraps `sigp/discv5` for Waku peer discovery: builds a local ENR carrying the
+//! relay-shards (`rs`) field, runs the discv5 service, and discovers peers
+//! filtered to our cluster.
 //!
-//! **Milestone 1.** TODO: wrap discv5 with Waku protocol-id isolation + shard
-//! filtering; implement the enrtree TXT resolver and feed results to the peer
-//! manager. Default bootstrap: [`waku_core::preset::TWN`]`.dns_discovery_enrtree`.
+//! Waku isolation: nwaku does not customise the discv5 protocol-id — it stays on
+//! the standard `discv5` wire protocol and isolates by bootstrapping only from
+//! Waku nodes and filtering ENRs by the Waku shard fields. We do the same; the
+//! cluster filter is applied to every discovered ENR.
+//!
+//! EIP-1459 DNS discovery (the enrtree TXT resolver) is the remaining M1 piece
+//! and will live alongside this.
 
-/// An `enrtree://` URL to resolve via EIP-1459 DNS discovery.
-#[derive(Clone, Debug)]
-pub struct EnrTreeUrl(pub String);
+use std::net::Ipv4Addr;
+
+use discv5::enr::{CombinedKey, Enr, NodeId};
+use discv5::{ConfigBuilder, Discv5, ListenConfig};
+use thiserror::Error;
+use waku_enr::RelayShards;
+
+pub use discv5::enr::{CombinedKey as Key, Enr as WakuEnr};
+pub use waku_enr::{RelayShards as Shards, ENR_KEY_RS, ENR_KEY_RSV};
+
+#[derive(Debug, Error)]
+pub enum DiscoveryError {
+    #[error("ENR build failed: {0}")]
+    EnrBuild(String),
+    #[error("discv5 init failed: {0}")]
+    Init(String),
+    #[error("discv5 error: {0}")]
+    Discv5(String),
+}
+
+/// Configuration for the discv5 service.
+pub struct DiscoveryConfig {
+    pub listen_ip: Ipv4Addr,
+    pub udp_port: u16,
+    /// Advertised TCP port (libp2p) in the ENR, if any.
+    pub tcp_port: Option<u16>,
+    /// Externally reachable IP to advertise; defaults to `listen_ip`.
+    pub external_ip: Option<Ipv4Addr>,
+    pub cluster_id: u16,
+    pub shards: Vec<u16>,
+    pub bootstrap: Vec<Enr<CombinedKey>>,
+    /// discv5/ENR signing key (secp256k1). Generated if `None`.
+    pub key: Option<CombinedKey>,
+}
+
+impl DiscoveryConfig {
+    pub fn new(udp_port: u16) -> Self {
+        Self {
+            listen_ip: Ipv4Addr::LOCALHOST,
+            udp_port,
+            tcp_port: None,
+            external_ip: None,
+            cluster_id: waku_core::TWN.cluster_id,
+            shards: (0..waku_core::TWN.shard_count).collect(),
+            bootstrap: Vec::new(),
+            key: None,
+        }
+    }
+
+    pub fn with_cluster(mut self, cluster_id: u16, shards: Vec<u16>) -> Self {
+        self.cluster_id = cluster_id;
+        self.shards = shards;
+        self
+    }
+
+    pub fn with_bootstrap(mut self, bootstrap: Vec<Enr<CombinedKey>>) -> Self {
+        self.bootstrap = bootstrap;
+        self
+    }
+}
+
+/// The Waku discovery service.
+pub struct Discovery {
+    discv5: Discv5,
+    cluster_id: u16,
+}
+
+impl Discovery {
+    /// Build the local ENR and the discv5 service (not yet started).
+    pub fn new(mut config: DiscoveryConfig) -> Result<Self, DiscoveryError> {
+        let key = config
+            .key
+            .take()
+            .unwrap_or_else(CombinedKey::generate_secp256k1);
+        let local_enr = build_waku_enr(&key, &config)?;
+
+        let listen = ListenConfig::Ipv4 {
+            ip: config.listen_ip,
+            port: config.udp_port,
+        };
+        let discv5_config = ConfigBuilder::new(listen).build();
+
+        let discv5 = Discv5::new(local_enr, key, discv5_config)
+            .map_err(|e| DiscoveryError::Init(e.to_string()))?;
+
+        for enr in config.bootstrap.drain(..) {
+            if let Err(e) = discv5.add_enr(enr) {
+                tracing::warn!(error = %e, "skipping invalid bootstrap ENR");
+            }
+        }
+
+        Ok(Self {
+            discv5,
+            cluster_id: config.cluster_id,
+        })
+    }
+
+    /// Start the discv5 service (binds the UDP socket).
+    pub async fn start(&mut self) -> Result<(), DiscoveryError> {
+        self.discv5
+            .start()
+            .await
+            .map_err(|e| DiscoveryError::Discv5(e.to_string()))
+    }
+
+    pub fn local_enr(&self) -> Enr<CombinedKey> {
+        self.discv5.local_enr()
+    }
+
+    /// Run a FINDNODE query, returning only ENRs in our cluster.
+    pub async fn discover(&self) -> Result<Vec<Enr<CombinedKey>>, DiscoveryError> {
+        let cluster = self.cluster_id;
+        let predicate = Box::new(move |enr: &Enr<CombinedKey>| {
+            enr_relay_shards(enr)
+                .map(|rs| rs.cluster_id == cluster)
+                .unwrap_or(false)
+        });
+        self.discv5
+            .find_node_predicate(NodeId::random(), predicate, 16)
+            .await
+            .map_err(|e| DiscoveryError::Discv5(e.to_string()))
+    }
+
+    /// ENRs currently held in the routing table (e.g. via prior sessions).
+    pub fn table_peers(&self) -> Vec<Enr<CombinedKey>> {
+        self.discv5.table_entries_enr()
+    }
+}
+
+/// Build a Waku ENR: ip/udp(/tcp) plus the relay-shards `rs` field.
+fn build_waku_enr(
+    key: &CombinedKey,
+    config: &DiscoveryConfig,
+) -> Result<Enr<CombinedKey>, DiscoveryError> {
+    let shards = RelayShards::new(config.cluster_id, config.shards.iter().copied());
+    let rs_bytes = shards
+        .to_indices_list()
+        .map_err(|e| DiscoveryError::EnrBuild(e.to_string()))?;
+
+    let mut builder = Enr::builder();
+    builder.ip4(config.external_ip.unwrap_or(config.listen_ip));
+    builder.udp4(config.udp_port);
+    if let Some(tcp) = config.tcp_port {
+        builder.tcp4(tcp);
+    }
+    // The `rs` value is a raw byte string; passing `&[u8]` RLP-encodes it as such.
+    builder.add_value(ENR_KEY_RS, &rs_bytes.as_slice());
+
+    builder
+        .build(key)
+        .map_err(|e| DiscoveryError::EnrBuild(e.to_string()))
+}
+
+/// Read the relay-shards descriptor from an ENR (`rs` indices list, else `rsv`).
+pub fn enr_relay_shards(enr: &Enr<CombinedKey>) -> Option<RelayShards> {
+    if let Some(Ok(bytes)) = enr.get_decodable::<bytes::Bytes>(ENR_KEY_RS) {
+        return RelayShards::from_indices_list(bytes.as_ref()).ok();
+    }
+    if let Some(Ok(bytes)) = enr.get_decodable::<bytes::Bytes>(ENR_KEY_RSV) {
+        return RelayShards::from_bit_vector(bytes.as_ref()).ok();
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_enr_carries_relay_shards() {
+        let cfg = DiscoveryConfig::new(0).with_cluster(1, vec![0, 1, 2, 7]);
+        let disco = Discovery::new(cfg).expect("build discovery");
+        let shards = enr_relay_shards(&disco.local_enr()).expect("rs field present");
+        assert_eq!(shards.cluster_id, 1);
+        assert_eq!(shards.shards, vec![0, 1, 2, 7]);
+    }
+}

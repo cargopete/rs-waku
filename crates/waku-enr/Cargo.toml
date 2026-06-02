@@ -1,6 +1,6 @@
 [package]
 name = "waku-enr"
-description = "31/WAKU2-ENR — ENR construction/parse with Waku fields (Milestone 1)"
+description = "31/WAKU2-ENR — Waku ENR fields (relay shards) (Milestone 1)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,4 +10,4 @@ authors.workspace = true
 
 [dependencies]
 waku-core = { workspace = true }
-# Milestone 1: enr = { workspace = true } (keep aligned with discv5's enr)
+thiserror = { workspace = true }

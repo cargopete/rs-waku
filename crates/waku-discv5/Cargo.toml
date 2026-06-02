@@ -11,4 +11,12 @@ authors.workspace = true
 [dependencies]
 waku-core = { workspace = true }
 waku-enr = { workspace = true }
-# Milestone 1: discv5 = { workspace = true }, enr, tokio, hickory-resolver (DNS)
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+discv5 = { workspace = true }
+bytes = "1"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
