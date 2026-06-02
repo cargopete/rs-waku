@@ -53,6 +53,7 @@ async fn discovers_dials_and_relays() {
         advertised_ip: Ipv4Addr::LOCALHOST,
         advertised_tcp_port: a_tcp,
         bootstrap: vec![],
+        dns_bootstrap: vec![],
     });
     let (a, mut a_events) = spawn(cfg_a).await.expect("spawn A");
     wait_listening(&mut a_events).await;
@@ -69,6 +70,7 @@ async fn discovers_dials_and_relays() {
         advertised_ip: Ipv4Addr::LOCALHOST,
         advertised_tcp_port: b_tcp,
         bootstrap: vec![a_enr],
+        dns_bootstrap: vec![],
     });
     let (b, mut b_events) = spawn(cfg_b).await.expect("spawn B");
 

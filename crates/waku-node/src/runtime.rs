@@ -53,6 +53,8 @@ pub struct DiscoverySettings {
     pub advertised_tcp_port: u16,
     /// Bootstrap ENRs to seed the DHT and dial immediately.
     pub bootstrap: Vec<WakuEnr>,
+    /// EIP-1459 `enrtree://` URLs resolved to extra bootstrap ENRs at startup.
+    pub dns_bootstrap: Vec<String>,
 }
 
 /// Configuration for the libp2p swarm underlying a node.
@@ -258,12 +260,19 @@ pub async fn spawn(
     let mut discv5_enr = None;
     if let Some(settings) = config.discovery.take() {
         let key = keypair_to_combined(&config.keypair)?;
+
+        // Resolve any enrtree:// URLs into additional bootstrap ENRs.
+        let mut bootstrap = settings.bootstrap;
+        if !settings.dns_bootstrap.is_empty() {
+            bootstrap.extend(resolve_dns_bootstrap(&settings.dns_bootstrap).await);
+        }
+
         let mut dcfg =
             DiscoveryConfig::new(settings.udp_port).with_cluster(config.cluster_id, config.shards);
         dcfg.key = Some(key);
         dcfg.external_ip = Some(settings.advertised_ip);
         dcfg.tcp_port = Some(settings.advertised_tcp_port);
-        dcfg.bootstrap = settings.bootstrap.clone();
+        dcfg.bootstrap = bootstrap.clone();
 
         let mut discovery = Discovery::new(dcfg).map_err(|e| NodeError::Build(e.to_string()))?;
         discovery
@@ -272,11 +281,7 @@ pub async fn spawn(
             .map_err(|e| NodeError::Build(e.to_string()))?;
         discv5_enr = Some(discovery.local_enr());
 
-        tokio::spawn(discovery_loop(
-            discovery,
-            settings.bootstrap,
-            cmd_tx.clone(),
-        ));
+        tokio::spawn(discovery_loop(discovery, bootstrap, cmd_tx.clone()));
     }
 
     Ok((
@@ -297,6 +302,28 @@ fn keypair_to_combined(keypair: &Keypair) -> Result<CombinedKey, NodeError> {
         .map_err(|_| NodeError::Build("node identity must be secp256k1 for discv5".into()))?;
     let mut secret = kp.secret().to_bytes();
     CombinedKey::secp256k1_from_bytes(&mut secret).map_err(|e| NodeError::Build(e.to_string()))
+}
+
+/// Resolve `enrtree://` URLs to bootstrap ENRs via DNS (best-effort).
+async fn resolve_dns_bootstrap(urls: &[String]) -> Vec<WakuEnr> {
+    let resolver = match waku_discv5::HickoryResolver::system() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build DNS resolver; skipping enrtree bootstrap");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for url in urls {
+        match waku_discv5::resolve_enrtree(url, &resolver).await {
+            Ok(enrs) => {
+                tracing::info!(url, count = enrs.len(), "resolved enrtree bootstrap");
+                out.extend(enrs);
+            }
+            Err(e) => tracing::warn!(url, error = %e, "enrtree resolution failed"),
+        }
+    }
+    out
 }
 
 /// Dial bootstrap peers, then periodically discover and dial new cluster peers.

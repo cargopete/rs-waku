@@ -12,6 +12,12 @@
 //! EIP-1459 DNS discovery (the enrtree TXT resolver) is the remaining M1 piece
 //! and will live alongside this.
 
+pub mod dns;
+
+#[cfg(feature = "dns")]
+pub use dns::HickoryResolver;
+pub use dns::{resolve as resolve_enrtree, EnrTreeLink, TxtResolver};
+
 use std::net::Ipv4Addr;
 
 use discv5::enr::{CombinedKey, Enr, EnrPublicKey, NodeId};

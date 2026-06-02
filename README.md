@@ -20,9 +20,10 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
   RFC-14 hash, `ValidationMode::Anonymous` (StrictNoSign), go-libp2p mesh defaults.
 - **`waku-metadata`** — 66/WAKU2-METADATA request/response (length-prefixed
   protobuf); the node disconnects peers on a cluster-id mismatch.
-- **`waku-enr` + `waku-discv5`** — the ENR relay-shards codec (`rs`/`rsv`) and a
+- **`waku-enr` + `waku-discv5`** — the ENR relay-shards codec (`rs`/`rsv`), a
   `sigp/discv5` wrapper that discovers peers filtered to our cluster and resolves
-  each ENR to a dialable libp2p address (secp256k1 ENR → libp2p peer-id bridge).
+  each ENR to a dialable libp2p address (secp256k1 ENR → libp2p peer-id bridge),
+  and an EIP-1459 `enrtree` DNS resolver (verified against the live Status tree).
 - **`waku-node`** — composes `relay + identify + metadata` into one
   `#[derive(NetworkBehaviour)]` swarm driven by a single task; talks to the app
   over command/event channels (`subscribe` / `publish` / `dial`); optionally runs
@@ -41,7 +42,7 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 | `waku-relay` | 11/WAKU2-RELAY (gossipsub) | ✅ done (scoring TODO) |
 | `waku-metadata` | 66/WAKU2-METADATA | ✅ done |
 | `waku-enr` | 31/WAKU2-ENR (relay-shards codec) | ✅ done |
-| `waku-discv5` | 33/WAKU2-DISCV5 (DNS disc. pending) | 🟡 discv5 done |
+| `waku-discv5` | 33/WAKU2-DISCV5 + EIP-1459 DNS | ✅ done |
 | `waku-node` | composition / swarm driver / config | 🟡 M1 (relay+metadata+discv5) |
 | `wakunode` | node binary (nwaku-style CLI) | 🟡 M1 |
 | `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | ⬜ M2 |
@@ -69,8 +70,8 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] 31/WAKU2-ENR: relay-shards (`rs`/`rsv`) codec.
 - [x] 33/WAKU2-DISCV5: Waku discv5 (sigp/discv5), ENR shards, cluster-filtered discovery.
 - [x] Wire discv5 into the node: shared secp256k1 key, ENR→libp2p peer-id bridge, auto-dial discovered/bootstrap peers (end-to-end discover→dial→relay test).
-- [ ] EIP-1459 DNS discovery (enrtree TXT resolver) for bootstrap.
-- [ ] Expose discv5 flags on the `wakunode` CLI.
+- [x] EIP-1459 DNS discovery (enrtree TXT resolver, root-sig verification); node resolves `enrtree://` bootstrap at startup. Verified against the live Status prod tree.
+- [ ] Expose discv5 / dns-discovery flags on the `wakunode` CLI.
 - [ ] WSS / QUIC transports for browser interop.
 - [ ] **Gate:** join a live nwaku via the simulator; confirm we stay in-mesh
   (not pruned/penalized) and a real nwaku-produced hash vector matches ours.
