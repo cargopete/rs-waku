@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 waku-core = { workspace = true }
 waku-node = { workspace = true }
+libp2p = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

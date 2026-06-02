@@ -9,6 +9,10 @@
 //! chain syncer, REST) over channels. RLN proof generation runs on a blocking
 //! pool so it never stalls the swarm.
 
+pub mod runtime;
+
+pub use runtime::{spawn, Event, NodeConfig, NodeError, NodeHandle, WakuBehaviour};
+
 use waku_core::{NetworkPreset, TWN};
 
 /// Node configuration. Mirrors nwaku CLI semantics (`--cluster-id`, `--shard`,

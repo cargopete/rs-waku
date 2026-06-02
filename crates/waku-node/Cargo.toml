@@ -19,4 +19,22 @@ waku-filter = { workspace = true }
 waku-lightpush = { workspace = true }
 waku-peer-exchange = { workspace = true }
 waku-metadata = { workspace = true }
-# Milestone 1+: libp2p (swarm + macros for #[derive(NetworkBehaviour)]), tokio, tracing
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+prost = { workspace = true }
+libp2p = { workspace = true, features = [
+    "tcp",
+    "tokio",
+    "noise",
+    "yamux",
+    "macros",
+    "identify",
+    "gossipsub",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
