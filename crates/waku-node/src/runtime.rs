@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use crate::ratelimit::RateLimiters;
 
 use futures::StreamExt;
+use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::gossipsub::MessageAcceptance;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
@@ -152,6 +153,7 @@ pub struct WakuBehaviour {
     pub peer_exchange: waku_peer_exchange::Behaviour,
     pub filter_subscribe: waku_filter::SubscribeBehaviour,
     pub filter_push: waku_filter::PushBehaviour,
+    pub connection_limits: connection_limits::Behaviour,
 }
 
 #[derive(Debug, Error)]
@@ -193,6 +195,8 @@ pub struct NodeConfig {
     pub discovery: Option<DiscoverySettings>,
     /// If set, persist accepted (non-ephemeral) relay messages to this store.
     pub store: Option<Arc<dyn MessageStore>>,
+    /// Maximum total established connections (DoS guard).
+    pub max_connections: u32,
 }
 
 impl NodeConfig {
@@ -208,6 +212,7 @@ impl NodeConfig {
             shards: (0..TWN.shard_count).collect(),
             discovery: None,
             store: None,
+            max_connections: 300,
         }
     }
 
@@ -511,6 +516,9 @@ impl NodeHandle {
 }
 
 fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
+    let limits = ConnectionLimits::default()
+        .with_max_established(Some(config.max_connections))
+        .with_max_established_per_peer(Some(4));
     let swarm = libp2p::SwarmBuilder::with_existing_identity(config.keypair.clone())
         .with_tokio()
         .with_tcp(
@@ -519,7 +527,7 @@ fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
             yamux::Config::default,
         )
         .map_err(|e| NodeError::Build(e.to_string()))?
-        .with_behaviour(|key| {
+        .with_behaviour(move |key| {
             let relay = waku_relay::build_relay()
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             let identify = identify::Behaviour::new(
@@ -535,6 +543,7 @@ fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
                 peer_exchange: waku_peer_exchange::build(),
                 filter_subscribe: waku_filter::build_subscribe(),
                 filter_push: waku_filter::build_push(),
+                connection_limits: connection_limits::Behaviour::new(limits),
             })
         })
         .map_err(|e| NodeError::Build(e.to_string()))?

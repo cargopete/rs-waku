@@ -74,6 +74,10 @@ struct Cli {
     /// Serve the nwaku-compatible REST API on this port (e.g. 8645).
     #[arg(long = "rest-port")]
     rest_port: Option<u16>,
+
+    /// Maximum total established connections (DoS guard).
+    #[arg(long = "max-connections", default_value_t = 300)]
+    max_connections: u32,
 }
 
 #[tokio::main]
@@ -105,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = NodeConfig::new()
         .with_listen_addr(listen)
         .with_cluster(cli.cluster_id, shards.clone());
+    config.max_connections = cli.max_connections;
 
     // Assemble discovery settings if any discovery mechanism was requested.
     let want_discovery = cli.discv5 || cli.dns_discovery || !cli.bootstrap_enrs.is_empty();
