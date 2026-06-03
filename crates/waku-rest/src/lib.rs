@@ -113,6 +113,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/lightpush/v1/message", post(lightpush))
         .route("/store/v3/messages", get(store_query))
+        .route("/admin/v1/peers", get(admin_peers))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 
@@ -374,6 +376,47 @@ async fn store_query(
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminPeer {
+    peer_id: String,
+    connected: bool,
+}
+
+/// `GET /admin/v1/peers` — currently connected peers.
+async fn admin_peers(State(s): State<AppState>) -> impl IntoResponse {
+    let peers: Vec<AdminPeer> = s
+        .node
+        .connected_peers()
+        .into_iter()
+        .map(|p| AdminPeer {
+            peer_id: p.to_string(),
+            connected: true,
+        })
+        .collect();
+    Json(peers)
+}
+
+/// `GET /metrics` — Prometheus text exposition.
+async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
+    use prometheus::{Encoder, Gauge, Registry, TextEncoder};
+
+    let registry = Registry::new();
+    let peers = Gauge::new("rs_waku_connected_peers", "Currently connected peers").unwrap();
+    peers.set(s.node.connected_peers().len() as f64);
+    let _ = registry.register(Box::new(peers));
+
+    if let Some(store) = &s.store {
+        let stored = Gauge::new("rs_waku_stored_messages", "Messages in the store").unwrap();
+        stored.set(store.message_count().await.unwrap_or(0) as f64);
+        let _ = registry.register(Box::new(stored));
+    }
+
+    let mut buf = Vec::new();
+    let _ = TextEncoder::new().encode(&registry.gather(), &mut buf);
+    (StatusCode::OK, String::from_utf8_lossy(&buf).into_owned())
+}
+
 fn parse_hash(hex_str: &str) -> Result<MessageHash, String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("bad hex cursor: {e}"))?;
     bytes
@@ -477,6 +520,38 @@ mod tests {
         let messages = json.as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["payload"], B64.encode(b"cached"));
+    }
+
+    #[tokio::test]
+    async fn metrics_and_admin_peers() {
+        let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+        store
+            .put(
+                "/waku/2/rs/1/0",
+                &WakuMessage::new("/a/1/b/proto", b"x".to_vec()),
+                0,
+            )
+            .await
+            .unwrap();
+        let store: Arc<dyn MessageStore> = store;
+        let app = router(test_state(Some(store)).await);
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("rs_waku_connected_peers"));
+        assert!(body.contains("rs_waku_stored_messages 1"));
+
+        let resp = app
+            .oneshot(Request::get("/admin/v1/peers").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, "[]"); // isolated node, no peers
     }
 
     #[tokio::test]

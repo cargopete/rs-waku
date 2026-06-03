@@ -131,4 +131,7 @@ pub trait MessageStore: Send + Sync {
 
     /// Of the given hashes, return those present in the store.
     async fn exists(&self, hashes: &[MessageHash]) -> Result<Vec<MessageHash>, StoreError>;
+
+    /// Total number of stored messages.
+    async fn message_count(&self) -> Result<u64, StoreError>;
 }

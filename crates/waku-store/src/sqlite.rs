@@ -260,6 +260,10 @@ impl MessageStore for SqliteStore {
         })
     }
 
+    async fn message_count(&self) -> Result<u64, StoreError> {
+        self.count().await
+    }
+
     async fn exists(&self, hashes: &[MessageHash]) -> Result<Vec<MessageHash>, StoreError> {
         if hashes.is_empty() {
             return Ok(Vec::new());

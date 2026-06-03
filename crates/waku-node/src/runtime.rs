@@ -302,6 +302,7 @@ pub struct NodeHandle {
     cmd_tx: mpsc::Sender<Command>,
     discv5_enr: Option<WakuEnr>,
     store: Option<Arc<dyn MessageStore>>,
+    connected: Arc<Mutex<HashSet<PeerId>>>,
 }
 
 impl NodeHandle {
@@ -312,6 +313,16 @@ impl NodeHandle {
     /// The node's message store, if store-on-relay is enabled.
     pub fn store(&self) -> Option<Arc<dyn MessageStore>> {
         self.store.clone()
+    }
+
+    /// Currently connected peers.
+    pub fn connected_peers(&self) -> Vec<PeerId> {
+        self.connected
+            .lock()
+            .expect("connected lock")
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// This node's discv5 ENR, if discovery is enabled. Hand it to other nodes
@@ -547,6 +558,7 @@ pub async fn spawn(
 
     let store = config.store.take();
     let peer_book: PeerBook = Arc::new(Mutex::new(Vec::new()));
+    let connected: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (evt_tx, evt_rx) = mpsc::channel(256);
@@ -559,6 +571,7 @@ pub async fn spawn(
         local_meta,
         store.clone(),
         peer_book.clone(),
+        connected.clone(),
     ));
 
     // Optionally start discv5 discovery, sharing the node's secp256k1 key.
@@ -600,6 +613,7 @@ pub async fn spawn(
             cmd_tx,
             discv5_enr,
             store,
+            connected,
         },
         evt_rx,
     ))
@@ -688,6 +702,7 @@ async fn dial_discovered(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the swarm driver owns all shared state
 async fn run(
     mut swarm: Swarm<WakuBehaviour>,
     mut cmd_rx: mpsc::Receiver<Command>,
@@ -696,6 +711,7 @@ async fn run(
     local_meta: WakuMetadata,
     store: Option<Arc<dyn MessageStore>>,
     peer_book: PeerBook,
+    connected: Arc<Mutex<HashSet<PeerId>>>,
 ) {
     let mut pending = Pending::default();
     let mut filters: FilterRegistry = HashMap::new();
@@ -716,6 +732,7 @@ async fn run(
                     &mut pending,
                     &peer_book,
                     &mut filters,
+                    &connected,
                 )
                 .await
                 .is_err()
@@ -822,6 +839,7 @@ async fn handle_event(
     pending: &mut Pending,
     peer_book: &PeerBook,
     filters: &mut FilterRegistry,
+    connected: &Mutex<HashSet<PeerId>>,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -831,6 +849,7 @@ async fn handle_event(
                 .map_err(|_| ())?;
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            connected.lock().expect("connected lock").insert(peer_id);
             // Kick off the metadata handshake immediately.
             swarm
                 .behaviour_mut()
@@ -842,6 +861,7 @@ async fn handle_event(
                 .map_err(|_| ())?;
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            connected.lock().expect("connected lock").remove(&peer_id);
             evt_tx
                 .send(Event::PeerDisconnected(peer_id))
                 .await
