@@ -8,7 +8,9 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::ratelimit::RateLimiters;
 
 use futures::StreamExt;
 use libp2p::gossipsub::MessageAcceptance;
@@ -715,6 +717,7 @@ async fn run(
 ) {
     let mut pending = Pending::default();
     let mut filters: FilterRegistry = HashMap::new();
+    let mut limits = RateLimiters::default();
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
@@ -733,6 +736,7 @@ async fn run(
                     &peer_book,
                     &mut filters,
                     &connected,
+                    &mut limits,
                 )
                 .await
                 .is_err()
@@ -840,6 +844,7 @@ async fn handle_event(
     peer_book: &PeerBook,
     filters: &mut FilterRegistry,
     connected: &Mutex<HashSet<PeerId>>,
+    limits: &mut RateLimiters,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -947,20 +952,30 @@ async fn handle_event(
             }
         }
         SwarmEvent::Behaviour(WakuBehaviourEvent::StoreQuery(
-            request_response::Event::Message { message, .. },
+            request_response::Event::Message { peer, message, .. },
         )) => match message {
             request_response::Message::Request {
                 request, channel, ..
             } => {
-                let response = match store {
-                    Some(s) => store_query::serve(s.as_ref(), &request).await,
-                    None => StoreQueryResponse {
+                let response = if !limits.store.allow(peer, Instant::now()) {
+                    StoreQueryResponse {
                         request_id: request.request_id.clone(),
-                        status_code: Some(503),
-                        status_desc: Some("store not enabled".into()),
+                        status_code: Some(429),
+                        status_desc: Some("rate limited".into()),
                         messages: Vec::new(),
                         pagination_cursor: None,
-                    },
+                    }
+                } else {
+                    match store {
+                        Some(s) => store_query::serve(s.as_ref(), &request).await,
+                        None => StoreQueryResponse {
+                            request_id: request.request_id.clone(),
+                            status_code: Some(503),
+                            status_desc: Some("store not enabled".into()),
+                            messages: Vec::new(),
+                            pagination_cursor: None,
+                        },
+                    }
                 };
                 let _ = swarm
                     .behaviour_mut()
@@ -986,12 +1001,16 @@ async fn handle_event(
             }
         }
         SwarmEvent::Behaviour(WakuBehaviourEvent::Lightpush(
-            request_response::Event::Message { message, .. },
+            request_response::Event::Message { peer, message, .. },
         )) => match message {
             request_response::Message::Request {
                 request, channel, ..
             } => {
-                let response = serve_lightpush(swarm, &request);
+                let response = if !limits.lightpush.allow(peer, Instant::now()) {
+                    LightpushResponse::error(request.request_id.clone(), 429, "rate limited")
+                } else {
+                    serve_lightpush(swarm, &request)
+                };
                 let _ = swarm
                     .behaviour_mut()
                     .lightpush
