@@ -413,6 +413,40 @@ async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
         let _ = registry.register(Box::new(stored));
     }
 
+    // Per-protocol activity counters.
+    let snap = s.node.metrics().snapshot();
+    for (name, help, value) in [
+        (
+            "rs_waku_relay_messages_total",
+            "Relay messages accepted",
+            snap.relay_messages,
+        ),
+        (
+            "rs_waku_store_queries_total",
+            "Store queries served",
+            snap.store_queries,
+        ),
+        (
+            "rs_waku_lightpush_requests_total",
+            "Lightpush requests served",
+            snap.lightpush_requests,
+        ),
+        (
+            "rs_waku_filter_pushes_total",
+            "Filter pushes sent",
+            snap.filter_pushes,
+        ),
+        (
+            "rs_waku_rate_limited_total",
+            "Requests rejected by rate limiting",
+            snap.rate_limited,
+        ),
+    ] {
+        let counter = prometheus::Counter::new(name, help).unwrap();
+        counter.inc_by(value as f64);
+        let _ = registry.register(Box::new(counter));
+    }
+
     let mut buf = Vec::new();
     let _ = TextEncoder::new().encode(&registry.gather(), &mut buf);
     (StatusCode::OK, String::from_utf8_lossy(&buf).into_owned())
@@ -546,6 +580,8 @@ mod tests {
         let body = body_string(resp).await;
         assert!(body.contains("rs_waku_connected_peers"));
         assert!(body.contains("rs_waku_stored_messages 1"));
+        assert!(body.contains("rs_waku_relay_messages_total"));
+        assert!(body.contains("rs_waku_rate_limited_total"));
 
         let resp = app
             .oneshot(Request::get("/admin/v1/peers").body(Body::empty()).unwrap())

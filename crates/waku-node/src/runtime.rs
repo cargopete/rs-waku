@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiters;
 
 use futures::StreamExt;
@@ -93,17 +94,19 @@ fn apply_filter_request(
 }
 
 /// Push a message to every subscriber whose filter matches it (filter-push).
+/// Returns the number of peers pushed to.
 fn push_filter_matches(
     swarm: &mut Swarm<WakuBehaviour>,
     filters: &FilterRegistry,
     topic: &str,
     msg: &WakuMessage,
-) {
+) -> usize {
     let targets: Vec<PeerId> = filters
         .iter()
         .filter(|(_, subs)| subs.iter().any(|s| s.matches(topic, &msg.content_topic)))
         .map(|(peer, _)| *peer)
         .collect();
+    let pushed = targets.len();
     for peer in targets {
         let push = MessagePush {
             waku_message: Some(msg.clone()),
@@ -111,6 +114,7 @@ fn push_filter_matches(
         };
         swarm.behaviour_mut().filter_push.send_request(&peer, push);
     }
+    pushed
 }
 
 /// Cap on the ENRs we keep for serving peer-exchange.
@@ -324,11 +328,17 @@ pub struct NodeHandle {
     discv5_enr: Option<WakuEnr>,
     store: Option<Arc<dyn MessageStore>>,
     connected: Arc<Mutex<HashSet<PeerId>>>,
+    metrics: Metrics,
 }
 
 impl NodeHandle {
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// Node metric counters (for the REST `/metrics` endpoint).
+    pub fn metrics(&self) -> Metrics {
+        self.metrics.clone()
     }
 
     /// The node's message store, if store-on-relay is enabled.
@@ -590,6 +600,7 @@ pub async fn spawn(
     let store = config.store.take();
     let peer_book: PeerBook = Arc::new(Mutex::new(Vec::new()));
     let connected: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
+    let metrics = Metrics::new();
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (evt_tx, evt_rx) = mpsc::channel(256);
@@ -604,6 +615,7 @@ pub async fn spawn(
         peer_book.clone(),
         connected.clone(),
         config.ip_colocation_limit,
+        metrics.clone(),
     ));
 
     // Optionally start discv5 discovery, sharing the node's secp256k1 key.
@@ -646,6 +658,7 @@ pub async fn spawn(
             discv5_enr,
             store,
             connected,
+            metrics,
         },
         evt_rx,
     ))
@@ -745,6 +758,7 @@ async fn run(
     peer_book: PeerBook,
     connected: Arc<Mutex<HashSet<PeerId>>>,
     ip_limit: usize,
+    metrics: Metrics,
 ) {
     let mut pending = Pending::default();
     let mut filters: FilterRegistry = HashMap::new();
@@ -771,6 +785,7 @@ async fn run(
                     &mut limits,
                     &mut ip_counts,
                     ip_limit,
+                    &metrics,
                 )
                 .await
                 .is_err()
@@ -882,6 +897,7 @@ async fn handle_event(
     limits: &mut RateLimiters,
     ip_counts: &mut HashMap<IpAddr, usize>,
     ip_limit: usize,
+    metrics: &Metrics,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -958,6 +974,7 @@ async fn handle_event(
                     };
                     let verdict = validate(&facts, &ValidationPolicy::default());
                     if verdict == Validation::Accept {
+                        metrics.relay_message();
                         // Store-on-relay: persist non-ephemeral accepted messages
                         // (off the hot path, so DB latency never stalls the swarm).
                         if let Some(store) = store {
@@ -974,7 +991,8 @@ async fn handle_event(
                             }
                         }
                         // Push to any filter subscribers whose filter matches.
-                        push_filter_matches(swarm, filters, &topic, &decoded);
+                        let pushed = push_filter_matches(swarm, filters, &topic, &decoded);
+                        metrics.filter_pushes_add(pushed as u64);
 
                         let id = message_id
                             .0
@@ -1020,6 +1038,7 @@ async fn handle_event(
                 request, channel, ..
             } => {
                 let response = if !limits.store.allow(peer, Instant::now()) {
+                    metrics.rate_limited();
                     StoreQueryResponse {
                         request_id: request.request_id.clone(),
                         status_code: Some(429),
@@ -1028,6 +1047,7 @@ async fn handle_event(
                         pagination_cursor: None,
                     }
                 } else {
+                    metrics.store_query();
                     match store {
                         Some(s) => store_query::serve(s.as_ref(), &request).await,
                         None => StoreQueryResponse {
@@ -1069,8 +1089,10 @@ async fn handle_event(
                 request, channel, ..
             } => {
                 let response = if !limits.lightpush.allow(peer, Instant::now()) {
+                    metrics.rate_limited();
                     LightpushResponse::error(request.request_id.clone(), 429, "rate limited")
                 } else {
+                    metrics.lightpush_request();
                     serve_lightpush(swarm, &request)
                 };
                 let _ = swarm

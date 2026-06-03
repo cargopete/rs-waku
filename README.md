@@ -119,7 +119,7 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 
 **Milestone 5 — Operations**
 - [x] nwaku-compatible REST API (`axum`, port 8645): `debug`/`health`/`info`, relay publish + subscribe + poll cache (`/relay/v1/auto/...`), lightpush, store v3 query, `/admin/v1/peers`. Live via `wakunode --rest-port`; tested (oneshot + curl).
-- [x] Prometheus `/metrics` (connected peers, stored messages).
+- [x] Prometheus `/metrics`: connected peers, stored messages, and per-protocol counters (relay messages, store queries, lightpush, filter pushes, rate-limited).
 - [x] DoS protection: per-peer token-bucket request rate limits on store + lightpush (`429` on excess); libp2p connection limits (max established + per-peer cap, `--max-connections`).
 - [x] Prod-readiness: persistent secp256k1 identity (`--node-key-file`, stable peer-id/ENR across restarts) and durable file-backed store (`--store-path`); graceful shutdown (Ctrl-C/SIGTERM → clean stop); multi-stage `Dockerfile` (non-root, `/data` volume). All tested.
 - [x] ip-colocation limit: cap concurrent connections per remote IP (`--ip-colocation-limit`); over-limit peers are disconnected (tested).

@@ -9,9 +9,11 @@
 //! chain syncer, REST) over channels. RLN proof generation runs on a blocking
 //! pool so it never stalls the swarm.
 
+pub mod metrics;
 mod ratelimit;
 pub mod runtime;
 
+pub use metrics::{Metrics, MetricsSnapshot};
 pub use runtime::{
     spawn, DiscoverySettings, Event, NodeConfig, NodeError, NodeHandle, WakuBehaviour,
 };
