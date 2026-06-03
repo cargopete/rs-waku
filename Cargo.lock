@@ -5082,7 +5082,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waku-core"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "hex",
  "prost",
@@ -5092,7 +5092,7 @@ dependencies = [
 
 [[package]]
 name = "waku-discv5"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5113,7 +5113,7 @@ dependencies = [
 
 [[package]]
 name = "waku-enr"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "thiserror 2.0.18",
  "waku-core",
@@ -5121,7 +5121,7 @@ dependencies = [
 
 [[package]]
 name = "waku-filter"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -5132,7 +5132,7 @@ dependencies = [
 
 [[package]]
 name = "waku-lightpush"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -5143,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "waku-metadata"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -5154,7 +5154,7 @@ dependencies = [
 
 [[package]]
 name = "waku-node"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "futures",
  "libp2p",
@@ -5177,7 +5177,7 @@ dependencies = [
 
 [[package]]
 name = "waku-peer-exchange"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -5188,7 +5188,7 @@ dependencies = [
 
 [[package]]
 name = "waku-relay"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "libp2p",
  "prost",
@@ -5200,7 +5200,7 @@ dependencies = [
 
 [[package]]
 name = "waku-rest"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "axum",
  "base64",
@@ -5218,7 +5218,7 @@ dependencies = [
 
 [[package]]
 name = "waku-rln"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "rln",
  "thiserror 2.0.18",
@@ -5228,14 +5228,14 @@ dependencies = [
 
 [[package]]
 name = "waku-sds"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "waku-core",
 ]
 
 [[package]]
 name = "waku-store"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -5251,7 +5251,7 @@ dependencies = [
 
 [[package]]
 name = "wakunode"
-version = "0.0.0"
+version = "0.5.1"
 dependencies = [
  "clap",
  "hex",

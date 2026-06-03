@@ -5,16 +5,17 @@ feature parity with [nwaku](https://github.com/waku-org/nwaku) / go-waku by
 layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 `rust-libp2p`, `sigp/discv5`, and `zerokit`.
 
-> **Status: M1 complete (live on TWN mainnet); M2 RLN-Relay and M3 Store
-> substantially done.** A `wakunode` discovers peers via discv5/DNS, joins The
-> Waku Network mainnet, and relays `WakuMessage`s with the correct Waku
-> message-id + StrictNoSign. RLN-V2 proofs (generation/verification, nullifier
-> slashing, an inbound verifier) and a gossipsub validator seam are in; a SQLite
-> store persists accepted messages and serves 13/WAKU2-STORE v3 queries over the
-> wire. Milestone 4 service protocols (Light Push v3, Peer Exchange, Filter v2)
-> are done too. Remaining items either need external reference data (the RLN
-> contract, captured nwaku vectors) or are additive (Postgres, Store-Sync). Next:
-> Milestone 5 — the nwaku-compatible REST API.
+> **Status: M1–M5 substantially complete; prod-hardened and live on TWN
+> mainnet.** A `wakunode` discovers peers (discv5 + EIP-1459 DNS), joins The Waku
+> Network mainnet, relays `WakuMessage`s with the correct Waku message-id +
+> StrictNoSign, speaks store-v3 / lightpush / peer-exchange / filter-v2, and
+> serves an nwaku-compatible REST API with Prometheus metrics. RLN-V2 proofs
+> (gen/verify, nullifier slashing, inbound verifier) and the gossipsub validator
+> seam are in. Prod features: durable store, persistent identity, graceful
+> shutdown, a DoS triad (request rate limits + connection + ip-colocation
+> limits), TOML config, and Docker. The last mile to **byte-exact parity** needs
+> external inputs — an RLN-V2 contract + RPC (on-chain enforcement) and captured
+> nwaku vectors / the simulator (interop suite). See "Interop landmines" below.
 
 ## What works today
 
@@ -38,15 +39,16 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 - **`waku-lightpush` / `waku-peer-exchange` / `waku-filter`** — Light Push v3
   (publish via a full node), Peer Exchange (ask a peer for ENRs), and Filter v2
   (content-filtered push), all req/resp over LP-protobuf.
-- **`waku-node`** — composes **eight** behaviours (relay, identify, metadata,
-  store-query, lightpush, peer-exchange, filter-subscribe, filter-push) into one
-  `#[derive(NetworkBehaviour)]` swarm driven by a single task; command/event
-  channels (`subscribe`/`publish`/`dial`/`store_query`/`light_push`/
-  `peer_exchange`/`filter_subscribe`); optional discv5 with auto-dial; store-on-relay
-  persistence; a peer-book served via peer-exchange; a filter registry that
-  pushes matching messages to subscribers.
-- **`wakunode`** — a CLI (nwaku-style flags) running the above; `--dns-discovery`
-  joins TWN mainnet, `--staticnode` connects explicit peers.
+- **`waku-node`** — composes **nine** behaviours (relay, identify, metadata,
+  store-query, lightpush, peer-exchange, filter-subscribe, filter-push,
+  connection-limits) into one `#[derive(NetworkBehaviour)]` swarm driven by a
+  single task; command/event channels; optional discv5 with auto-dial;
+  store-on-relay persistence; a peer-book served via peer-exchange; a filter
+  registry that pushes matching messages to subscribers; per-peer request rate
+  limiting, ip-colocation, atomic metric counters, and graceful shutdown.
+- **`wakunode`** — a CLI (nwaku-style flags) + TOML `--config` running the above:
+  `--dns-discovery` joins TWN mainnet, `--store-path`/`--node-key-file` give
+  durable storage + a stable identity, `--rest-port` serves the REST API.
 - **Interop tests** — gossipsub loopback (id == RFC-14 hash), metadata
   cluster-mismatch, discv5 session, discover→dial→relay seeded with only an ENR,
   RLN proof/nullifier/inbound-verifier, store-on-relay (publish→store→query),
@@ -123,6 +125,7 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] DoS protection: per-peer token-bucket request rate limits on store + lightpush (`429` on excess); libp2p connection limits (max established + per-peer cap, `--max-connections`).
 - [x] Prod-readiness: persistent secp256k1 identity (`--node-key-file`, stable peer-id/ENR across restarts) and durable file-backed store (`--store-path`); graceful shutdown (Ctrl-C/SIGTERM → clean stop); multi-stage `Dockerfile` (non-root, `/data` volume). All tested.
 - [x] ip-colocation limit: cap concurrent connections per remote IP (`--ip-colocation-limit`); over-limit peers are disconnected (tested).
+- [x] TOML config file (`--config`): every setting file-configurable; CLI > file > defaults precedence (tested). `/debug/v1/info` reports real listen addresses.
 - [ ] Remaining REST endpoints (filter); run the Python interop suite.
 - [ ] **Gate:** pass the full Python interop suite protocol-by-protocol.
 
