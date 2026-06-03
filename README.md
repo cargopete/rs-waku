@@ -69,7 +69,7 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 | `waku-filter` | 12/WAKU2-FILTER v2 | ✅ done |
 | `waku-lightpush` | 19/WAKU2-LIGHTPUSH v3 | ✅ done |
 | `waku-peer-exchange` | 34/WAKU2-PEER-EXCHANGE | ✅ done |
-| `waku-rest` | nwaku-compatible REST API (port 8645) | ⬜ M5 |
+| `waku-rest` | nwaku-compatible REST API (port 8645) | 🟡 core endpoints |
 | `waku-sds` | Scalable Data Sync (optional) | ⬜ M6 |
 
 Legend: ✅ done · 🟡 partial · ⬜ stub.
@@ -118,7 +118,8 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] 34/WAKU2-PEER-EXCHANGE: LP-protobuf req/resp; node serves ENRs from a shared peer-book (populated by discovery/bootstrap); client `peer_exchange` (over-the-wire test).
 
 **Milestone 5 — Operations**
-- [ ] nwaku-compatible REST API (`axum`, port 8645): relay/store/filter/lightpush/admin/health.
+- [x] nwaku-compatible REST API (`axum`, port 8645): `debug`/`health`, relay publish (autosharded), 13/WAKU2-STORE v3 query. Live via `wakunode --rest-port`; tested (oneshot + curl).
+- [ ] Remaining REST endpoints (filter/lightpush/admin, relay GET cache).
 - [ ] Prometheus metrics (match nwaku names for dashboard reuse).
 - [ ] DoS protection: per-protocol rate limits, ip-colocation, relay:service split.
 - [ ] **Gate:** pass the full Python interop suite protocol-by-protocol.
@@ -168,10 +169,20 @@ cargo run -p wakunode -- --tcp-port 60000 --discv5-udp-port 9000 --dns-discovery
 # nodes, and stays connected through the metadata handshake.
 ```
 
+Serve the nwaku-compatible REST API (port 8645):
+
+```sh
+cargo run -p wakunode -- --tcp-port 60000 --store --rest-port 8645
+curl http://127.0.0.1:8645/debug/v1/version
+curl http://127.0.0.1:8645/health
+curl "http://127.0.0.1:8645/store/v3/messages?contentTopics=/app/1/x/proto"
+```
+
 Key flags (mirroring nwaku): `--cluster-id`, `--shard` (repeatable; empty = all
 shards), `--tcp-port`, `--staticnode` (repeatable), `--discv5-discovery`,
 `--discv5-udp-port`, `--ext-ip`, `--discv5-bootstrap-node` (repeatable),
-`--dns-discovery`, `--dns-discovery-url` (repeatable), `--rln-relay` (M2).
+`--dns-discovery`, `--dns-discovery-url` (repeatable), `--store`, `--rest-port`,
+`--rln-relay` (M2).
 
 ## License
 

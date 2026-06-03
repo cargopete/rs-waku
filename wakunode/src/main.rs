@@ -7,11 +7,13 @@
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use clap::Parser;
 use libp2p::Multiaddr;
 use waku_core::{ShardId, TWN};
 use waku_node::{spawn, DiscoverySettings, Event, NodeConfig, WakuEnr};
+use waku_store::{MessageStore, SqliteStore};
 
 /// rs-waku node (Logos Messaging) — native Rust.
 #[derive(Parser, Debug)]
@@ -64,6 +66,14 @@ struct Cli {
     /// enrtree:// URL for DNS discovery; repeatable. Defaults to the TWN tree.
     #[arg(long = "dns-discovery-url")]
     dns_discovery_urls: Vec<String>,
+
+    /// Enable 13/WAKU2-STORE (in-memory SQLite), persisting accepted messages.
+    #[arg(long, default_value_t = false)]
+    store: bool,
+
+    /// Serve the nwaku-compatible REST API on this port (e.g. 8645).
+    #[arg(long = "rest-port")]
+    rest_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -127,8 +137,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Optional message store (needed for store-on-relay and the REST store API).
+    let store: Option<Arc<dyn MessageStore>> = if cli.store || cli.rest_port.is_some() {
+        Some(Arc::new(SqliteStore::in_memory().await?))
+    } else {
+        None
+    };
+    config.store = store.clone();
+
     let (node, mut events) = spawn(config).await?;
     tracing::info!(peer_id = %node.peer_id(), "rs-waku node started");
+
+    if let Some(port) = cli.rest_port {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let state = waku_rest::AppState::new(node.clone(), store.clone());
+        tokio::spawn(async move {
+            if let Err(e) = waku_rest::serve(addr, state).await {
+                tracing::error!(error = %e, "REST API server stopped");
+            }
+        });
+        tracing::info!(%addr, "REST API enabled");
+    }
     if let Some(enr) = node.discv5_enr() {
         tracing::info!(enr = %enr.to_base64(), "local ENR (share me as a bootstrap node)");
     }

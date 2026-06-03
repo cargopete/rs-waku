@@ -1,6 +1,6 @@
 [package]
 name = "waku-rest"
-description = "REST API (axum) matching nwaku's OpenAPI, port 8645 (Milestone 5)"
+description = "nwaku-compatible REST API (axum), port 8645 (Milestone 5)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,4 +11,14 @@ authors.workspace = true
 [dependencies]
 waku-core = { workspace = true }
 waku-node = { workspace = true }
-# Milestone 5: axum = { workspace = true }, tokio, serde, tower-http
+waku-store = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = { workspace = true }
+
+[dev-dependencies]
+tower = "0.5"
