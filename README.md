@@ -46,7 +46,7 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 | `waku-node` | composition / swarm driver / config | 🟡 M1 (relay+metadata+discv5) |
 | `wakunode` | node binary (nwaku-style CLI) | 🟡 M1 |
 | `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | 🟡 proofs done |
-| `waku-store` | 13/WAKU2-STORE v3 + Store-Sync | ⬜ M3 |
+| `waku-store` | 13/WAKU2-STORE v3 + Store-Sync | 🟡 storage core |
 | `waku-filter` | 12/WAKU2-FILTER v2 | ⬜ M4 |
 | `waku-lightpush` | 19/WAKU2-LIGHTPUSH v3 | ⬜ M4 |
 | `waku-peer-exchange` | 34/WAKU2-PEER-EXCHANGE | ⬜ M4 |
@@ -88,8 +88,9 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [ ] **Gate:** bidirectional RLN proof verification with nwaku on a shared chain.
 
 **Milestone 3 — Store**
-- [ ] 13/WAKU2-STORE v3 query server + client (`sqlx`, SQLite then Postgres).
-- [ ] Retention policies (time / capacity / size); store-on-relay write path.
+- [x] Storage core: `MessageStore` trait + `sqlx` SQLite backend, hash-indexed; put/get/dedup, content-topic + time-range query with keyset cursor pagination, hashes-only mode, `exists`, time + capacity retention (tested).
+- [ ] v3 request/response protobuf wire protocol (query server + client behaviour).
+- [ ] store-on-relay write path (persist accepted relay messages); Postgres backend.
 - [ ] Store-Sync (Negentropy / range-based set reconciliation).
 
 **Milestone 4 — Service protocols**

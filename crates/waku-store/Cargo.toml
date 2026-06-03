@@ -11,4 +11,9 @@ authors.workspace = true
 [dependencies]
 waku-core = { workspace = true }
 async-trait = { workspace = true }
-# Milestone 3: sqlx = { workspace = true, features = ["postgres"] }, tokio, prost
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sqlx = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
