@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -20,6 +21,7 @@ use waku_core::{deterministic_hash, MessageHash, ShardId, WakuMessage, TWN};
 use waku_discv5::{Discovery, DiscoveryConfig, Key as CombinedKey, WakuEnr};
 use waku_metadata::WakuMetadata;
 use waku_relay::{validate, MessageFacts, RlnStatus, Validation, ValidationPolicy};
+use waku_store::MessageStore;
 
 /// Current Unix time in nanoseconds (for message timestamp validation).
 fn now_unix_nanos() -> i64 {
@@ -78,6 +80,8 @@ pub struct NodeConfig {
     pub shards: Vec<u16>,
     /// If set, run discv5 discovery and auto-dial discovered cluster peers.
     pub discovery: Option<DiscoverySettings>,
+    /// If set, persist accepted (non-ephemeral) relay messages to this store.
+    pub store: Option<Arc<dyn MessageStore>>,
 }
 
 impl NodeConfig {
@@ -92,6 +96,7 @@ impl NodeConfig {
             cluster_id: TWN.cluster_id,
             shards: (0..TWN.shard_count).collect(),
             discovery: None,
+            store: None,
         }
     }
 
@@ -162,11 +167,17 @@ pub struct NodeHandle {
     peer_id: PeerId,
     cmd_tx: mpsc::Sender<Command>,
     discv5_enr: Option<WakuEnr>,
+    store: Option<Arc<dyn MessageStore>>,
 }
 
 impl NodeHandle {
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// The node's message store, if store-on-relay is enabled.
+    pub fn store(&self) -> Option<Arc<dyn MessageStore>> {
+        self.store.clone()
     }
 
     /// This node's discv5 ENR, if discovery is enabled. Hand it to other nodes
@@ -261,10 +272,19 @@ pub async fn spawn(
             .map_err(|e| NodeError::Listen(e.to_string()))?;
     }
 
+    let store = config.store.take();
+
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (evt_tx, evt_rx) = mpsc::channel(256);
 
-    tokio::spawn(run(swarm, cmd_rx, evt_tx, local_cluster, local_meta));
+    tokio::spawn(run(
+        swarm,
+        cmd_rx,
+        evt_tx,
+        local_cluster,
+        local_meta,
+        store.clone(),
+    ));
 
     // Optionally start discv5 discovery, sharing the node's secp256k1 key.
     let mut discv5_enr = None;
@@ -299,6 +319,7 @@ pub async fn spawn(
             peer_id,
             cmd_tx,
             discv5_enr,
+            store,
         },
         evt_rx,
     ))
@@ -389,6 +410,7 @@ async fn run(
     evt_tx: mpsc::Sender<Event>,
     local_cluster: u32,
     local_meta: WakuMetadata,
+    store: Option<Arc<dyn MessageStore>>,
 ) {
     loop {
         tokio::select! {
@@ -397,7 +419,7 @@ async fn run(
                 None => break, // all handles dropped
             },
             event = swarm.select_next_some() => {
-                if handle_event(&mut swarm, event, &evt_tx, local_cluster, &local_meta)
+                if handle_event(&mut swarm, event, &evt_tx, local_cluster, &local_meta, &store)
                     .await
                     .is_err()
                 {
@@ -454,6 +476,7 @@ async fn handle_event(
     evt_tx: &mpsc::Sender<Event>,
     local_cluster: u32,
     local_meta: &WakuMetadata,
+    store: &Option<Arc<dyn MessageStore>>,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -503,6 +526,21 @@ async fn handle_event(
                     };
                     let verdict = validate(&facts, &ValidationPolicy::default());
                     if verdict == Validation::Accept {
+                        // Store-on-relay: persist non-ephemeral accepted messages
+                        // (off the hot path, so DB latency never stalls the swarm).
+                        if let Some(store) = store {
+                            if decoded.ephemeral != Some(true) {
+                                let store = store.clone();
+                                let pt = topic.clone();
+                                let to_store = decoded.clone();
+                                let rx_time = now_unix_nanos();
+                                tokio::spawn(async move {
+                                    if let Err(e) = store.put(&pt, &to_store, rx_time).await {
+                                        tracing::warn!(error = %e, "failed to store message");
+                                    }
+                                });
+                            }
+                        }
                         let id = message_id
                             .0
                             .as_slice()
