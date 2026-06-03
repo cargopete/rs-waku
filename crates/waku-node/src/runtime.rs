@@ -6,7 +6,7 @@
 //! REST API, etc. will later attach.
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ use crate::ratelimit::RateLimiters;
 use futures::StreamExt;
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::gossipsub::MessageAcceptance;
+use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{gossipsub, identify, identity::Keypair, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
@@ -197,6 +198,17 @@ pub struct NodeConfig {
     pub store: Option<Arc<dyn MessageStore>>,
     /// Maximum total established connections (DoS guard).
     pub max_connections: u32,
+    /// Max concurrent connections from a single IP (0 = unlimited).
+    pub ip_colocation_limit: usize,
+}
+
+/// Extract the first IP from a multiaddr (for ip-colocation accounting).
+fn multiaddr_ip(addr: &Multiaddr) -> Option<IpAddr> {
+    addr.iter().find_map(|p| match p {
+        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    })
 }
 
 impl NodeConfig {
@@ -213,6 +225,7 @@ impl NodeConfig {
             discovery: None,
             store: None,
             max_connections: 300,
+            ip_colocation_limit: 20,
         }
     }
 
@@ -590,6 +603,7 @@ pub async fn spawn(
         store.clone(),
         peer_book.clone(),
         connected.clone(),
+        config.ip_colocation_limit,
     ));
 
     // Optionally start discv5 discovery, sharing the node's secp256k1 key.
@@ -730,10 +744,12 @@ async fn run(
     store: Option<Arc<dyn MessageStore>>,
     peer_book: PeerBook,
     connected: Arc<Mutex<HashSet<PeerId>>>,
+    ip_limit: usize,
 ) {
     let mut pending = Pending::default();
     let mut filters: FilterRegistry = HashMap::new();
     let mut limits = RateLimiters::default();
+    let mut ip_counts: HashMap<IpAddr, usize> = HashMap::new();
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
@@ -753,6 +769,8 @@ async fn run(
                     &mut filters,
                     &connected,
                     &mut limits,
+                    &mut ip_counts,
+                    ip_limit,
                 )
                 .await
                 .is_err()
@@ -862,6 +880,8 @@ async fn handle_event(
     filters: &mut FilterRegistry,
     connected: &Mutex<HashSet<PeerId>>,
     limits: &mut RateLimiters,
+    ip_counts: &mut HashMap<IpAddr, usize>,
+    ip_limit: usize,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -870,7 +890,22 @@ async fn handle_event(
                 .await
                 .map_err(|_| ())?;
         }
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        SwarmEvent::ConnectionEstablished {
+            peer_id, endpoint, ..
+        } => {
+            // ip-colocation guard: cap concurrent connections per remote IP.
+            if ip_limit > 0 {
+                if let Some(ip) = multiaddr_ip(endpoint.get_remote_address()) {
+                    let count = ip_counts.entry(ip).or_insert(0);
+                    *count += 1;
+                    if *count > ip_limit {
+                        *count -= 1;
+                        tracing::warn!(%peer_id, %ip, "ip-colocation limit exceeded; disconnecting");
+                        let _ = swarm.disconnect_peer_id(peer_id);
+                        return Ok(());
+                    }
+                }
+            }
             connected.lock().expect("connected lock").insert(peer_id);
             // Kick off the metadata handshake immediately.
             swarm
@@ -882,7 +917,17 @@ async fn handle_event(
                 .await
                 .map_err(|_| ())?;
         }
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+        SwarmEvent::ConnectionClosed {
+            peer_id, endpoint, ..
+        } => {
+            if let Some(ip) = multiaddr_ip(endpoint.get_remote_address()) {
+                if let Some(count) = ip_counts.get_mut(&ip) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        ip_counts.remove(&ip);
+                    }
+                }
+            }
             connected.lock().expect("connected lock").remove(&peer_id);
             evt_tx
                 .send(Event::PeerDisconnected(peer_id))

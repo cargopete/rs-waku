@@ -81,6 +81,10 @@ struct Cli {
     #[arg(long = "max-connections", default_value_t = 300)]
     max_connections: u32,
 
+    /// Max concurrent connections from a single IP (0 = unlimited).
+    #[arg(long = "ip-colocation-limit", default_value_t = 20)]
+    ip_colocation_limit: usize,
+
     /// Persist the message store to this SQLite file (default: in-memory).
     #[arg(long = "store-path")]
     store_path: Option<String>,
@@ -147,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_listen_addr(listen)
         .with_cluster(cli.cluster_id, shards.clone());
     config.max_connections = cli.max_connections;
+    config.ip_colocation_limit = cli.ip_colocation_limit;
     if let Some(path) = &cli.node_key_file {
         config.keypair = load_or_create_key(path)?;
         tracing::info!(path = %path.display(), "loaded persistent node identity");

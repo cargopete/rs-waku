@@ -122,7 +122,8 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] Prometheus `/metrics` (connected peers, stored messages).
 - [x] DoS protection: per-peer token-bucket request rate limits on store + lightpush (`429` on excess); libp2p connection limits (max established + per-peer cap, `--max-connections`).
 - [x] Prod-readiness: persistent secp256k1 identity (`--node-key-file`, stable peer-id/ENR across restarts) and durable file-backed store (`--store-path`); graceful shutdown (Ctrl-C/SIGTERM → clean stop); multi-stage `Dockerfile` (non-root, `/data` volume). All tested.
-- [ ] Remaining REST endpoints (filter); ip-colocation; run the Python interop suite.
+- [x] ip-colocation limit: cap concurrent connections per remote IP (`--ip-colocation-limit`); over-limit peers are disconnected (tested).
+- [ ] Remaining REST endpoints (filter); run the Python interop suite.
 - [ ] **Gate:** pass the full Python interop suite protocol-by-protocol.
 
 **Milestone 6 — Reliability & hardening**
