@@ -19,14 +19,18 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use waku_core::{deterministic_hash, MessageHash, ShardId, WakuMessage, TWN};
 use waku_discv5::{Discovery, DiscoveryConfig, Key as CombinedKey, WakuEnr};
+use waku_lightpush::{LightpushRequest, LightpushResponse};
 use waku_metadata::WakuMetadata;
 use waku_relay::{validate, MessageFacts, RlnStatus, Validation, ValidationPolicy};
 use waku_store::store_query::{self, StoreQueryRequest, StoreQueryResponse};
 use waku_store::MessageStore;
 
-/// Pending outbound store queries awaiting a response, keyed by request id.
-type PendingQueries =
-    HashMap<OutboundRequestId, oneshot::Sender<Result<StoreQueryResponse, String>>>;
+/// Outbound requests awaiting their response, keyed by request id.
+#[derive(Default)]
+struct Pending {
+    store_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<StoreQueryResponse, String>>>,
+    lightpush: HashMap<OutboundRequestId, oneshot::Sender<Result<LightpushResponse, String>>>,
+}
 
 /// Current Unix time in nanoseconds (for message timestamp validation).
 fn now_unix_nanos() -> i64 {
@@ -47,6 +51,7 @@ pub struct WakuBehaviour {
     pub identify: identify::Behaviour,
     pub metadata: waku_metadata::Behaviour,
     pub store_query: store_query::Behaviour,
+    pub lightpush: waku_lightpush::Behaviour,
 }
 
 #[derive(Debug, Error)]
@@ -170,6 +175,11 @@ enum Command {
         request: Box<StoreQueryRequest>,
         reply: oneshot::Sender<Result<StoreQueryResponse, String>>,
     },
+    LightPush {
+        peer: PeerId,
+        request: Box<LightpushRequest>,
+        reply: oneshot::Sender<Result<LightpushResponse, String>>,
+    },
 }
 
 /// Handle for issuing commands to a running node.
@@ -258,6 +268,33 @@ impl NodeHandle {
             .map_err(|_| NodeError::NodeStopped)?
             .map_err(NodeError::Command)
     }
+
+    /// Light-push a message to `peer` (a full relay node), which injects it into
+    /// gossipsub on `pubsub_topic`.
+    pub async fn light_push(
+        &self,
+        peer: PeerId,
+        pubsub_topic: impl Into<String>,
+        message: WakuMessage,
+    ) -> Result<LightpushResponse, NodeError> {
+        let (reply, rx) = oneshot::channel();
+        let request = LightpushRequest {
+            request_id: String::new(),
+            pubsub_topic: pubsub_topic.into(),
+            message: Some(message),
+        };
+        self.cmd_tx
+            .send(Command::LightPush {
+                peer,
+                request: Box::new(request),
+                reply,
+            })
+            .await
+            .map_err(|_| NodeError::NodeStopped)?;
+        rx.await
+            .map_err(|_| NodeError::NodeStopped)?
+            .map_err(NodeError::Command)
+    }
 }
 
 fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
@@ -281,6 +318,7 @@ fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
                 identify,
                 metadata: waku_metadata::build(),
                 store_query: store_query::build(),
+                lightpush: waku_lightpush::build(),
             })
         })
         .map_err(|e| NodeError::Build(e.to_string()))?
@@ -444,11 +482,11 @@ async fn run(
     local_meta: WakuMetadata,
     store: Option<Arc<dyn MessageStore>>,
 ) {
-    let mut pending_queries: PendingQueries = HashMap::new();
+    let mut pending = Pending::default();
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
-                Some(cmd) => handle_command(&mut swarm, cmd, &mut pending_queries),
+                Some(cmd) => handle_command(&mut swarm, cmd, &mut pending),
                 None => break, // all handles dropped
             },
             event = swarm.select_next_some() => {
@@ -459,7 +497,7 @@ async fn run(
                     local_cluster,
                     &local_meta,
                     &store,
-                    &mut pending_queries,
+                    &mut pending,
                 )
                 .await
                 .is_err()
@@ -471,11 +509,7 @@ async fn run(
     }
 }
 
-fn handle_command(
-    swarm: &mut Swarm<WakuBehaviour>,
-    cmd: Command,
-    pending_queries: &mut PendingQueries,
-) {
+fn handle_command(swarm: &mut Swarm<WakuBehaviour>, cmd: Command, pending: &mut Pending) {
     match cmd {
         Command::Subscribe { shard, reply } => {
             let topic = waku_relay::shard_topic(shard);
@@ -521,7 +555,18 @@ fn handle_command(
                 .behaviour_mut()
                 .store_query
                 .send_request(&peer, *request);
-            pending_queries.insert(id, reply);
+            pending.store_queries.insert(id, reply);
+        }
+        Command::LightPush {
+            peer,
+            request,
+            reply,
+        } => {
+            let id = swarm
+                .behaviour_mut()
+                .lightpush
+                .send_request(&peer, *request);
+            pending.lightpush.insert(id, reply);
         }
     }
 }
@@ -533,7 +578,7 @@ async fn handle_event(
     local_cluster: u32,
     local_meta: &WakuMetadata,
     store: &Option<Arc<dyn MessageStore>>,
-    pending_queries: &mut PendingQueries,
+    pending: &mut Pending,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -660,7 +705,7 @@ async fn handle_event(
                 request_id,
                 response,
             } => {
-                if let Some(tx) = pending_queries.remove(&request_id) {
+                if let Some(tx) = pending.store_queries.remove(&request_id) {
                     let _ = tx.send(Ok(response));
                 }
             }
@@ -670,7 +715,37 @@ async fn handle_event(
                 request_id, error, ..
             },
         )) => {
-            if let Some(tx) = pending_queries.remove(&request_id) {
+            if let Some(tx) = pending.store_queries.remove(&request_id) {
+                let _ = tx.send(Err(error.to_string()));
+            }
+        }
+        SwarmEvent::Behaviour(WakuBehaviourEvent::Lightpush(
+            request_response::Event::Message { message, .. },
+        )) => match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                let response = serve_lightpush(swarm, &request);
+                let _ = swarm
+                    .behaviour_mut()
+                    .lightpush
+                    .send_response(channel, response);
+            }
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => {
+                if let Some(tx) = pending.lightpush.remove(&request_id) {
+                    let _ = tx.send(Ok(response));
+                }
+            }
+        },
+        SwarmEvent::Behaviour(WakuBehaviourEvent::Lightpush(
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            },
+        )) => {
+            if let Some(tx) = pending.lightpush.remove(&request_id) {
                 let _ = tx.send(Err(error.to_string()));
             }
         }
@@ -712,6 +787,23 @@ fn handle_metadata(
             }
             _ => None,
         },
+    }
+}
+
+/// Publish a light-pushed message into gossipsub and report the outcome
+/// (19/WAKU2-LIGHTPUSH v3 server side).
+fn serve_lightpush(swarm: &mut Swarm<WakuBehaviour>, req: &LightpushRequest) -> LightpushResponse {
+    let Some(message) = &req.message else {
+        return LightpushResponse::error(req.request_id.clone(), 400, "missing message");
+    };
+    let topic = gossipsub::IdentTopic::new(req.pubsub_topic.clone());
+    let data = prost::Message::encode_to_vec(message);
+    match swarm.behaviour_mut().relay.publish(topic.hash(), data) {
+        Ok(_) => {
+            let count = swarm.behaviour().relay.mesh_peers(&topic.hash()).count() as u32;
+            LightpushResponse::ok(req.request_id.clone(), count)
+        }
+        Err(e) => LightpushResponse::error(req.request_id.clone(), 503, e.to_string()),
     }
 }
 

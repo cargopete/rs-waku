@@ -59,7 +59,7 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 | `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | 🟡 proofs+nullifier+verifier |
 | `waku-store` | 13/WAKU2-STORE v3 + Store-Sync | 🟡 core + v3 wire |
 | `waku-filter` | 12/WAKU2-FILTER v2 | ⬜ M4 |
-| `waku-lightpush` | 19/WAKU2-LIGHTPUSH v3 | ⬜ M4 |
+| `waku-lightpush` | 19/WAKU2-LIGHTPUSH v3 | ✅ done |
 | `waku-peer-exchange` | 34/WAKU2-PEER-EXCHANGE | ⬜ M4 |
 | `waku-rest` | nwaku-compatible REST API (port 8645) | ⬜ M5 |
 | `waku-sds` | Scalable Data Sync (optional) | ⬜ M6 |
@@ -106,7 +106,7 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 
 **Milestone 4 — Service protocols**
 - [ ] 12/WAKU2-FILTER v2 (filter-subscribe / filter-push, refresh ping).
-- [ ] 19/WAKU2-LIGHTPUSH v3.
+- [x] 19/WAKU2-LIGHTPUSH v3: LP-protobuf req/resp; full node publishes the pushed message into gossipsub and reports relay-peer count; client `light_push` (3-node B→A→C delivery test).
 - [ ] 34/WAKU2-PEER-EXCHANGE.
 
 **Milestone 5 — Operations**

@@ -4917,6 +4917,10 @@ dependencies = [
 name = "waku-lightpush"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "futures",
+ "libp2p",
+ "prost",
  "waku-core",
 ]
 
