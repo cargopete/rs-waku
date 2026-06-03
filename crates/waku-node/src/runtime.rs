@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -21,6 +21,7 @@ use waku_core::{deterministic_hash, MessageHash, ShardId, WakuMessage, TWN};
 use waku_discv5::{Discovery, DiscoveryConfig, Key as CombinedKey, WakuEnr};
 use waku_lightpush::{LightpushRequest, LightpushResponse};
 use waku_metadata::WakuMetadata;
+use waku_peer_exchange::{self, PeerExchangeRpc};
 use waku_relay::{validate, MessageFacts, RlnStatus, Validation, ValidationPolicy};
 use waku_store::store_query::{self, StoreQueryRequest, StoreQueryResponse};
 use waku_store::MessageStore;
@@ -30,6 +31,25 @@ use waku_store::MessageStore;
 struct Pending {
     store_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<StoreQueryResponse, String>>>,
     lightpush: HashMap<OutboundRequestId, oneshot::Sender<Result<LightpushResponse, String>>>,
+    peer_exchange: HashMap<OutboundRequestId, oneshot::Sender<Result<PeerExchangeRpc, String>>>,
+}
+
+/// Cap on the ENRs we keep for serving peer-exchange.
+const PEER_BOOK_CAP: usize = 200;
+
+/// ENRs we've learned (bootstrap + discovered), shared with peer-exchange.
+type PeerBook = Arc<Mutex<Vec<WakuEnr>>>;
+
+/// Remember an ENR for peer-exchange (dedup by node id, bounded).
+fn remember_enr(book: &Mutex<Vec<WakuEnr>>, enr: WakuEnr) {
+    let mut book = book.lock().expect("peer book lock");
+    if book.iter().any(|e| e.node_id() == enr.node_id()) {
+        return;
+    }
+    if book.len() >= PEER_BOOK_CAP {
+        book.remove(0);
+    }
+    book.push(enr);
 }
 
 /// Current Unix time in nanoseconds (for message timestamp validation).
@@ -52,6 +72,7 @@ pub struct WakuBehaviour {
     pub metadata: waku_metadata::Behaviour,
     pub store_query: store_query::Behaviour,
     pub lightpush: waku_lightpush::Behaviour,
+    pub peer_exchange: waku_peer_exchange::Behaviour,
 }
 
 #[derive(Debug, Error)]
@@ -180,6 +201,11 @@ enum Command {
         request: Box<LightpushRequest>,
         reply: oneshot::Sender<Result<LightpushResponse, String>>,
     },
+    PeerExchange {
+        peer: PeerId,
+        num_peers: u64,
+        reply: oneshot::Sender<Result<PeerExchangeRpc, String>>,
+    },
 }
 
 /// Handle for issuing commands to a running node.
@@ -295,6 +321,32 @@ impl NodeHandle {
             .map_err(|_| NodeError::NodeStopped)?
             .map_err(NodeError::Command)
     }
+
+    /// Ask `peer` for up to `num_peers` ENRs (34/WAKU2-PEER-EXCHANGE).
+    pub async fn peer_exchange(
+        &self,
+        peer: PeerId,
+        num_peers: u64,
+    ) -> Result<Vec<WakuEnr>, NodeError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::PeerExchange {
+                peer,
+                num_peers,
+                reply,
+            })
+            .await
+            .map_err(|_| NodeError::NodeStopped)?;
+        let rpc = rx
+            .await
+            .map_err(|_| NodeError::NodeStopped)?
+            .map_err(NodeError::Command)?;
+        Ok(rpc
+            .enrs()
+            .iter()
+            .filter_map(|b| waku_discv5::enr_from_bytes(b))
+            .collect())
+    }
 }
 
 fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
@@ -319,6 +371,7 @@ fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
                 metadata: waku_metadata::build(),
                 store_query: store_query::build(),
                 lightpush: waku_lightpush::build(),
+                peer_exchange: waku_peer_exchange::build(),
             })
         })
         .map_err(|e| NodeError::Build(e.to_string()))?
@@ -343,6 +396,7 @@ pub async fn spawn(
     }
 
     let store = config.store.take();
+    let peer_book: PeerBook = Arc::new(Mutex::new(Vec::new()));
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (evt_tx, evt_rx) = mpsc::channel(256);
@@ -354,6 +408,7 @@ pub async fn spawn(
         local_cluster,
         local_meta,
         store.clone(),
+        peer_book.clone(),
     ));
 
     // Optionally start discv5 discovery, sharing the node's secp256k1 key.
@@ -381,7 +436,12 @@ pub async fn spawn(
             .map_err(|e| NodeError::Build(e.to_string()))?;
         discv5_enr = Some(discovery.local_enr());
 
-        tokio::spawn(discovery_loop(discovery, bootstrap, cmd_tx.clone()));
+        tokio::spawn(discovery_loop(
+            discovery,
+            bootstrap,
+            cmd_tx.clone(),
+            peer_book.clone(),
+        ));
     }
 
     Ok((
@@ -432,12 +492,14 @@ async fn discovery_loop(
     discovery: Discovery,
     bootstrap: Vec<WakuEnr>,
     cmd_tx: mpsc::Sender<Command>,
+    peer_book: PeerBook,
 ) {
     let mut known: HashSet<PeerId> = HashSet::new();
 
     for enr in &bootstrap {
+        remember_enr(&peer_book, enr.clone());
         if let Some(peer) = waku_discv5::enr_to_dialable(enr) {
-            dial_discovered(&cmd_tx, &mut known, peer).await;
+            dial_discovered(&cmd_tx, &mut known, &peer_book, peer).await;
         }
     }
 
@@ -449,7 +511,7 @@ async fn discovery_loop(
         match discovery.discover_dialable().await {
             Ok(peers) => {
                 for peer in peers {
-                    dial_discovered(&cmd_tx, &mut known, peer).await;
+                    dial_discovered(&cmd_tx, &mut known, &peer_book, peer).await;
                 }
             }
             Err(e) => tracing::debug!(error = %e, "discovery query failed"),
@@ -460,8 +522,10 @@ async fn discovery_loop(
 async fn dial_discovered(
     cmd_tx: &mpsc::Sender<Command>,
     known: &mut HashSet<PeerId>,
+    peer_book: &PeerBook,
     peer: waku_discv5::DiscoveredPeer,
 ) {
+    remember_enr(peer_book, peer.enr.clone());
     if !known.insert(peer.peer_id) {
         return;
     }
@@ -481,6 +545,7 @@ async fn run(
     local_cluster: u32,
     local_meta: WakuMetadata,
     store: Option<Arc<dyn MessageStore>>,
+    peer_book: PeerBook,
 ) {
     let mut pending = Pending::default();
     loop {
@@ -498,6 +563,7 @@ async fn run(
                     &local_meta,
                     &store,
                     &mut pending,
+                    &peer_book,
                 )
                 .await
                 .is_err()
@@ -568,9 +634,21 @@ fn handle_command(swarm: &mut Swarm<WakuBehaviour>, cmd: Command, pending: &mut 
                 .send_request(&peer, *request);
             pending.lightpush.insert(id, reply);
         }
+        Command::PeerExchange {
+            peer,
+            num_peers,
+            reply,
+        } => {
+            let id = swarm
+                .behaviour_mut()
+                .peer_exchange
+                .send_request(&peer, PeerExchangeRpc::query(num_peers));
+            pending.peer_exchange.insert(id, reply);
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)] // central event dispatch; all inputs are needed
 async fn handle_event(
     swarm: &mut Swarm<WakuBehaviour>,
     event: SwarmEvent<WakuBehaviourEvent>,
@@ -579,6 +657,7 @@ async fn handle_event(
     local_meta: &WakuMetadata,
     store: &Option<Arc<dyn MessageStore>>,
     pending: &mut Pending,
+    peer_book: &PeerBook,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -746,6 +825,43 @@ async fn handle_event(
             },
         )) => {
             if let Some(tx) = pending.lightpush.remove(&request_id) {
+                let _ = tx.send(Err(error.to_string()));
+            }
+        }
+        SwarmEvent::Behaviour(WakuBehaviourEvent::PeerExchange(
+            request_response::Event::Message { message, .. },
+        )) => match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                let num = request.requested().unwrap_or(0) as usize;
+                let enrs: Vec<Vec<u8>> = {
+                    let book = peer_book.lock().expect("peer book lock");
+                    book.iter()
+                        .take(num)
+                        .map(waku_discv5::enr_to_bytes)
+                        .collect()
+                };
+                let _ = swarm
+                    .behaviour_mut()
+                    .peer_exchange
+                    .send_response(channel, PeerExchangeRpc::response(enrs));
+            }
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => {
+                if let Some(tx) = pending.peer_exchange.remove(&request_id) {
+                    let _ = tx.send(Ok(response));
+                }
+            }
+        },
+        SwarmEvent::Behaviour(WakuBehaviourEvent::PeerExchange(
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            },
+        )) => {
+            if let Some(tx) = pending.peer_exchange.remove(&request_id) {
                 let _ = tx.send(Err(error.to_string()));
             }
         }

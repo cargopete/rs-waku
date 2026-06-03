@@ -40,6 +40,24 @@ pub struct DiscoveredPeer {
     pub peer_id: PeerId,
     pub addrs: Vec<Multiaddr>,
     pub shards: RelayShards,
+    pub enr: WakuEnr,
+}
+
+/// Serialize an ENR to its raw RLP bytes (the form used in `PeerInfo.enr` and
+/// discv5). Equivalent to base64-decoding `to_base64()`.
+pub fn enr_to_bytes(enr: &WakuEnr) -> Vec<u8> {
+    let s = enr.to_base64();
+    let b64 = s.strip_prefix("enr:").unwrap_or(&s);
+    data_encoding::BASE64URL_NOPAD
+        .decode(b64.as_bytes())
+        .unwrap_or_default()
+}
+
+/// Parse an ENR from raw RLP bytes (the inverse of [`enr_to_bytes`]).
+pub fn enr_from_bytes(bytes: &[u8]) -> Option<WakuEnr> {
+    use std::str::FromStr;
+    let text = format!("enr:{}", data_encoding::BASE64URL_NOPAD.encode(bytes));
+    WakuEnr::from_str(&text).ok()
 }
 
 #[derive(Debug, Error)]
@@ -197,6 +215,7 @@ pub fn enr_to_dialable(enr: &Enr<CombinedKey>) -> Option<DiscoveredPeer> {
         peer_id,
         addrs: vec![addr],
         shards,
+        enr: enr.clone(),
     })
 }
 

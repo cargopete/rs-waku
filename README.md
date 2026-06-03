@@ -60,7 +60,7 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 | `waku-store` | 13/WAKU2-STORE v3 + Store-Sync | 🟡 core + v3 wire |
 | `waku-filter` | 12/WAKU2-FILTER v2 | ⬜ M4 |
 | `waku-lightpush` | 19/WAKU2-LIGHTPUSH v3 | ✅ done |
-| `waku-peer-exchange` | 34/WAKU2-PEER-EXCHANGE | ⬜ M4 |
+| `waku-peer-exchange` | 34/WAKU2-PEER-EXCHANGE | ✅ done |
 | `waku-rest` | nwaku-compatible REST API (port 8645) | ⬜ M5 |
 | `waku-sds` | Scalable Data Sync (optional) | ⬜ M6 |
 
@@ -107,7 +107,7 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 **Milestone 4 — Service protocols**
 - [ ] 12/WAKU2-FILTER v2 (filter-subscribe / filter-push, refresh ping).
 - [x] 19/WAKU2-LIGHTPUSH v3: LP-protobuf req/resp; full node publishes the pushed message into gossipsub and reports relay-peer count; client `light_push` (3-node B→A→C delivery test).
-- [ ] 34/WAKU2-PEER-EXCHANGE.
+- [x] 34/WAKU2-PEER-EXCHANGE: LP-protobuf req/resp; node serves ENRs from a shared peer-book (populated by discovery/bootstrap); client `peer_exchange` (over-the-wire test).
 
 **Milestone 5 — Operations**
 - [ ] nwaku-compatible REST API (`axum`, port 8645): relay/store/filter/lightpush/admin/health.
