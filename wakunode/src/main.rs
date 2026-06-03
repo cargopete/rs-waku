@@ -6,10 +6,12 @@
 //! and relays. RLN/store/filter/lightpush land in later milestones.
 
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use clap::Parser;
+use libp2p::identity::Keypair;
 use libp2p::Multiaddr;
 use waku_core::{ShardId, TWN};
 use waku_node::{spawn, DiscoverySettings, Event, NodeConfig, WakuEnr};
@@ -78,6 +80,41 @@ struct Cli {
     /// Maximum total established connections (DoS guard).
     #[arg(long = "max-connections", default_value_t = 300)]
     max_connections: u32,
+
+    /// Persist the message store to this SQLite file (default: in-memory).
+    #[arg(long = "store-path")]
+    store_path: Option<String>,
+
+    /// Load/persist the node's secp256k1 identity at this path (stable peer-id/ENR).
+    #[arg(long = "node-key-file")]
+    node_key_file: Option<PathBuf>,
+}
+
+/// Load a secp256k1 identity from `path`, or generate and persist one.
+fn load_or_create_key(path: &Path) -> std::io::Result<Keypair> {
+    if path.exists() {
+        let hex_str = std::fs::read_to_string(path)?;
+        let mut bytes = hex::decode(hex_str.trim())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let secret = libp2p::identity::secp256k1::SecretKey::try_from_bytes(&mut bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(libp2p::identity::secp256k1::Keypair::from(secret).into())
+    } else {
+        let keypair = Keypair::generate_secp256k1();
+        let secret = keypair
+            .clone()
+            .try_into_secp256k1()
+            .expect("generated secp256k1")
+            .secret()
+            .to_bytes();
+        std::fs::write(path, hex::encode(secret))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(keypair)
+    }
 }
 
 #[tokio::main]
@@ -110,6 +147,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_listen_addr(listen)
         .with_cluster(cli.cluster_id, shards.clone());
     config.max_connections = cli.max_connections;
+    if let Some(path) = &cli.node_key_file {
+        config.keypair = load_or_create_key(path)?;
+        tracing::info!(path = %path.display(), "loaded persistent node identity");
+    }
 
     // Assemble discovery settings if any discovery mechanism was requested.
     let want_discovery = cli.discv5 || cli.dns_discovery || !cli.bootstrap_enrs.is_empty();
@@ -143,7 +184,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Optional message store (needed for store-on-relay and the REST store API).
-    let store: Option<Arc<dyn MessageStore>> = if cli.store || cli.rest_port.is_some() {
+    let store: Option<Arc<dyn MessageStore>> = if let Some(path) = &cli.store_path {
+        Some(Arc::new(
+            SqliteStore::connect(&format!("sqlite:{path}")).await?,
+        ))
+    } else if cli.store || cli.rest_port.is_some() {
         Some(Arc::new(SqliteStore::in_memory().await?))
     } else {
         None
@@ -219,4 +264,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_identity_persists_across_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodekey");
+
+        // First load generates + writes the key.
+        let k1 = load_or_create_key(&path).unwrap();
+        assert!(path.exists());
+        // Second load reads the same key back → same peer id.
+        let k2 = load_or_create_key(&path).unwrap();
+        assert_eq!(k1.public().to_peer_id(), k2.public().to_peer_id());
+    }
 }

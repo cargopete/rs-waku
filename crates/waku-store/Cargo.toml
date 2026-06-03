@@ -20,3 +20,4 @@ libp2p = { workspace = true, features = ["request-response"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"

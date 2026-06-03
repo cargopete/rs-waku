@@ -5192,6 +5192,7 @@ dependencies = [
  "libp2p",
  "prost",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5203,7 +5204,9 @@ name = "wakunode"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "hex",
  "libp2p",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",

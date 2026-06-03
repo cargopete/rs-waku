@@ -121,6 +121,7 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] nwaku-compatible REST API (`axum`, port 8645): `debug`/`health`/`info`, relay publish + subscribe + poll cache (`/relay/v1/auto/...`), lightpush, store v3 query, `/admin/v1/peers`. Live via `wakunode --rest-port`; tested (oneshot + curl).
 - [x] Prometheus `/metrics` (connected peers, stored messages).
 - [x] DoS protection: per-peer token-bucket request rate limits on store + lightpush (`429` on excess); libp2p connection limits (max established + per-peer cap, `--max-connections`).
+- [x] Prod-readiness: persistent secp256k1 identity (`--node-key-file`, stable peer-id/ENR across restarts) and durable file-backed store (`--store-path`); both tested.
 - [ ] Remaining REST endpoints (filter); ip-colocation; run the Python interop suite.
 - [ ] **Gate:** pass the full Python interop suite protocol-by-protocol.
 
@@ -178,11 +179,18 @@ curl http://127.0.0.1:8645/health
 curl "http://127.0.0.1:8645/store/v3/messages?contentTopics=/app/1/x/proto"
 ```
 
+For a durable, stable-identity node (survives restarts):
+
+```sh
+cargo run -p wakunode -- --tcp-port 60000 --dns-discovery \
+    --node-key-file ./node.key --store-path ./store.db --rest-port 8645
+```
+
 Key flags (mirroring nwaku): `--cluster-id`, `--shard` (repeatable; empty = all
 shards), `--tcp-port`, `--staticnode` (repeatable), `--discv5-discovery`,
 `--discv5-udp-port`, `--ext-ip`, `--discv5-bootstrap-node` (repeatable),
-`--dns-discovery`, `--dns-discovery-url` (repeatable), `--store`, `--rest-port`,
-`--rln-relay` (M2).
+`--dns-discovery`, `--dns-discovery-url` (repeatable), `--store`, `--store-path`,
+`--node-key-file`, `--rest-port`, `--max-connections`, `--rln-relay` (M2).
 
 ## License
 

@@ -380,6 +380,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}", dir.path().join("store.db").display());
+        let topic = "/waku/2/rs/1/0";
+        let m = msg("/app/1/x/proto", b"durable", 42);
+        let hash = deterministic_hash(topic, &m);
+
+        {
+            let store = SqliteStore::connect(&url).await.unwrap();
+            store.put(topic, &m, 0).await.unwrap();
+        } // pool dropped → file closed
+
+        // Reopen the same file: the message is still there.
+        let store = SqliteStore::connect(&url).await.unwrap();
+        let got = store.get(&hash).await.unwrap().expect("persisted");
+        assert_eq!(got.payload, m.payload);
+        assert_eq!(store.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn exists_and_retention() {
         let store = SqliteStore::in_memory().await.unwrap();
         let topic = "/waku/2/rs/1/0";

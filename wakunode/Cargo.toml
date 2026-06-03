@@ -17,8 +17,12 @@ waku-core = { workspace = true }
 waku-node = { workspace = true }
 waku-store = { workspace = true }
 waku-rest = { workspace = true }
-libp2p = { workspace = true }
+libp2p = { workspace = true, features = ["secp256k1"] }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
