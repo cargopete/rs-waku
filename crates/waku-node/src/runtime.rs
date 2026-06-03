@@ -328,12 +328,24 @@ pub struct NodeHandle {
     discv5_enr: Option<WakuEnr>,
     store: Option<Arc<dyn MessageStore>>,
     connected: Arc<Mutex<HashSet<PeerId>>>,
+    listen_addrs: Arc<Mutex<Vec<Multiaddr>>>,
     metrics: Metrics,
 }
 
 impl NodeHandle {
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// The node's current listen multiaddrs (each with `/p2p/<peer-id>` appended).
+    pub fn listen_addresses(&self) -> Vec<Multiaddr> {
+        let p2p = Protocol::P2p(self.peer_id);
+        self.listen_addrs
+            .lock()
+            .expect("listen addrs lock")
+            .iter()
+            .map(|a| a.clone().with(p2p.clone()))
+            .collect()
     }
 
     /// Node metric counters (for the REST `/metrics` endpoint).
@@ -600,6 +612,7 @@ pub async fn spawn(
     let store = config.store.take();
     let peer_book: PeerBook = Arc::new(Mutex::new(Vec::new()));
     let connected: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
+    let listen_addrs: Arc<Mutex<Vec<Multiaddr>>> = Arc::new(Mutex::new(Vec::new()));
     let metrics = Metrics::new();
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -616,6 +629,7 @@ pub async fn spawn(
         connected.clone(),
         config.ip_colocation_limit,
         metrics.clone(),
+        listen_addrs.clone(),
     ));
 
     // Optionally start discv5 discovery, sharing the node's secp256k1 key.
@@ -658,6 +672,7 @@ pub async fn spawn(
             discv5_enr,
             store,
             connected,
+            listen_addrs,
             metrics,
         },
         evt_rx,
@@ -759,6 +774,7 @@ async fn run(
     connected: Arc<Mutex<HashSet<PeerId>>>,
     ip_limit: usize,
     metrics: Metrics,
+    listen_addrs: Arc<Mutex<Vec<Multiaddr>>>,
 ) {
     let mut pending = Pending::default();
     let mut filters: FilterRegistry = HashMap::new();
@@ -786,6 +802,7 @@ async fn run(
                     &mut ip_counts,
                     ip_limit,
                     &metrics,
+                    &listen_addrs,
                 )
                 .await
                 .is_err()
@@ -898,9 +915,14 @@ async fn handle_event(
     ip_counts: &mut HashMap<IpAddr, usize>,
     ip_limit: usize,
     metrics: &Metrics,
+    listen_addrs: &Mutex<Vec<Multiaddr>>,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
+            listen_addrs
+                .lock()
+                .expect("listen addrs lock")
+                .push(address.clone());
             evt_tx
                 .send(Event::Listening(address))
                 .await

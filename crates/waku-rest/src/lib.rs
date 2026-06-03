@@ -243,7 +243,12 @@ async fn health(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn info(State(s): State<AppState>) -> impl IntoResponse {
     Json(InfoResponse {
-        listen_addresses: Vec::new(),
+        listen_addresses: s
+            .node
+            .listen_addresses()
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
         enr_uri: s.node.discv5_enr().map(|e| e.to_base64()),
         peer_id: s.node.peer_id().to_string(),
     })
@@ -466,7 +471,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt; // for `oneshot`
-    use waku_node::{spawn, NodeConfig};
+    use waku_node::{spawn, Event, NodeConfig};
     use waku_store::SqliteStore;
 
     async fn test_state(store: Option<Arc<dyn MessageStore>>) -> AppState {
@@ -555,6 +560,36 @@ mod tests {
         let messages = json.as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["payload"], B64.encode(b"cached"));
+    }
+
+    #[tokio::test]
+    async fn info_reports_listen_addresses() {
+        let (node, mut events) =
+            spawn(NodeConfig::new().with_listen_addr("/ip4/127.0.0.1/tcp/0".parse().unwrap()))
+                .await
+                .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(Event::Listening(_)) = events.recv().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let app = router(AppState::new(node, None));
+        let resp = app
+            .oneshot(Request::get("/debug/v1/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let addrs = json["listenAddresses"].as_array().unwrap();
+        assert!(
+            !addrs.is_empty(),
+            "a listening node should report addresses"
+        );
+        assert!(addrs[0].as_str().unwrap().contains("/p2p/"));
     }
 
     #[tokio::test]
