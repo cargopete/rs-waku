@@ -118,8 +118,8 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] 34/WAKU2-PEER-EXCHANGE: LP-protobuf req/resp; node serves ENRs from a shared peer-book (populated by discovery/bootstrap); client `peer_exchange` (over-the-wire test).
 
 **Milestone 5 — Operations**
-- [x] nwaku-compatible REST API (`axum`, port 8645): `debug`/`health`, relay publish (autosharded), 13/WAKU2-STORE v3 query. Live via `wakunode --rest-port`; tested (oneshot + curl).
-- [ ] Remaining REST endpoints (filter/lightpush/admin, relay GET cache).
+- [x] nwaku-compatible REST API (`axum`, port 8645): `debug`/`health`/`info`, relay publish + **subscribe + poll cache** (`/relay/v1/auto/...`), **lightpush** (`/lightpush/v1/message`), 13/WAKU2-STORE v3 query. Live via `wakunode --rest-port`; tested (oneshot + curl).
+- [ ] Remaining REST endpoints (filter, admin/peers); run the Python interop suite.
 - [ ] Prometheus metrics (match nwaku names for dashboard reuse).
 - [ ] DoS protection: per-protocol rate limits, ip-colocation, relay:service split.
 - [ ] **Gate:** pass the full Python interop suite protocol-by-protocol.

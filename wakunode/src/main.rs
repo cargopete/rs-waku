@@ -148,9 +148,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (node, mut events) = spawn(config).await?;
     tracing::info!(peer_id = %node.peer_id(), "rs-waku node started");
 
+    // The relay message cache feeds `GET /relay/v1/auto/messages/{ct}`.
+    let mut rest_cache: Option<waku_rest::MessageCache> = None;
     if let Some(port) = cli.rest_port {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
         let state = waku_rest::AppState::new(node.clone(), store.clone());
+        rest_cache = Some(state.cache());
         tokio::spawn(async move {
             if let Err(e) = waku_rest::serve(addr, state).await {
                 tracing::error!(error = %e, "REST API server stopped");
@@ -183,13 +186,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             event = events.recv() => match event {
-                Some(Event::Message { shard, id, message, .. }) => tracing::info!(
-                    topic = %shard.pubsub_topic(),
-                    id = %waku_core::hash_hex(&id),
-                    content_topic = %message.content_topic,
-                    bytes = message.payload.len(),
-                    "relayed message",
-                ),
+                Some(Event::Message { shard, id, message, .. }) => {
+                    tracing::info!(
+                        topic = %shard.pubsub_topic(),
+                        id = %waku_core::hash_hex(&id),
+                        content_topic = %message.content_topic,
+                        bytes = message.payload.len(),
+                        "relayed message",
+                    );
+                    if let Some(cache) = &rest_cache {
+                        cache.record(message);
+                    }
+                }
                 Some(Event::FilterMessage { message, .. }) => tracing::info!(
                     content_topic = %message.content_topic,
                     bytes = message.payload.len(),

@@ -7,8 +7,9 @@
 //! ⚠ JSON field shapes follow nwaku's REST spec (camelCase, base64 payloads);
 //! verify against `waku-org/waku-rest-api` before relying on interop.
 
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -18,12 +19,59 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use waku_core::{autoshard, ContentTopic, MessageHash, NetworkPreset, WakuMessage, TWN};
+use waku_core::{autoshard, ContentTopic, MessageHash, NetworkPreset, ShardId, WakuMessage, TWN};
 use waku_node::NodeHandle;
 use waku_store::{MessageStore, StoreQuery};
 
 /// Default nwaku REST port.
 pub const DEFAULT_REST_PORT: u16 = 8645;
+
+/// Max messages retained per content topic in the relay cache.
+const CACHE_PER_TOPIC: usize = 100;
+
+/// A per-content-topic cache of received relay messages, polled by
+/// `GET /relay/v1/auto/messages/{contentTopic}`. Only subscribed (registered)
+/// content topics are cached.
+#[derive(Clone, Default)]
+pub struct MessageCache {
+    inner: Arc<Mutex<HashMap<String, VecDeque<WakuMessage>>>>,
+}
+
+impl MessageCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Begin caching messages for `content_topic`.
+    pub fn register(&self, content_topic: String) {
+        self.inner
+            .lock()
+            .expect("cache")
+            .entry(content_topic)
+            .or_default();
+    }
+
+    /// Record a received message if its content topic is being cached.
+    pub fn record(&self, msg: WakuMessage) {
+        let mut cache = self.inner.lock().expect("cache");
+        if let Some(queue) = cache.get_mut(&msg.content_topic) {
+            if queue.len() >= CACHE_PER_TOPIC {
+                queue.pop_front();
+            }
+            queue.push_back(msg);
+        }
+    }
+
+    /// Take and clear the cached messages for `content_topic`.
+    fn drain(&self, content_topic: &str) -> Vec<WakuMessage> {
+        self.inner
+            .lock()
+            .expect("cache")
+            .get_mut(content_topic)
+            .map(|q| q.drain(..).collect())
+            .unwrap_or_default()
+    }
+}
 
 /// Shared state for the REST handlers.
 #[derive(Clone)]
@@ -32,6 +80,7 @@ pub struct AppState {
     pub store: Option<Arc<dyn MessageStore>>,
     pub preset: NetworkPreset,
     pub version: String,
+    pub cache: MessageCache,
 }
 
 impl AppState {
@@ -41,7 +90,13 @@ impl AppState {
             store,
             preset: TWN,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            cache: MessageCache::new(),
         }
+    }
+
+    /// The relay message cache (clone the handle to feed it from node events).
+    pub fn cache(&self) -> MessageCache {
+        self.cache.clone()
     }
 }
 
@@ -51,10 +106,12 @@ pub fn router(state: AppState) -> Router {
         .route("/debug/v1/version", get(version))
         .route("/debug/v1/info", get(info))
         .route("/health", get(health))
+        .route("/relay/v1/auto/subscriptions", post(relay_subscribe))
         .route(
             "/relay/v1/auto/messages/{content_topic}",
-            post(relay_publish),
+            post(relay_publish).get(relay_messages),
         )
+        .route("/lightpush/v1/message", post(lightpush))
         .route("/store/v3/messages", get(store_query))
         .with_state(state)
 }
@@ -119,6 +176,13 @@ impl RestWakuMessage {
             ephemeral: msg.ephemeral,
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LightpushBody {
+    pubsub_topic: Option<String>,
+    message: RestWakuMessage,
 }
 
 #[derive(Serialize)]
@@ -197,6 +261,64 @@ async fn relay_publish(
     };
     let shard = autoshard(s.preset.cluster_id, &ct, s.preset.shard_count);
 
+    match s.node.publish(shard, message).await {
+        Ok(hash) => (StatusCode::OK, hex::encode(hash)).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /relay/v1/auto/subscriptions` — subscribe to content topics (autoshard)
+/// and start caching their messages for polling.
+async fn relay_subscribe(
+    State(s): State<AppState>,
+    Json(content_topics): Json<Vec<String>>,
+) -> impl IntoResponse {
+    for ct_str in &content_topics {
+        let ct = match ContentTopic::parse(ct_str) {
+            Ok(ct) => ct,
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        };
+        let shard = autoshard(s.preset.cluster_id, &ct, s.preset.shard_count);
+        if let Err(e) = s.node.subscribe(shard).await {
+            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+        }
+        s.cache.register(ct_str.clone());
+    }
+    StatusCode::OK.into_response()
+}
+
+/// `GET /relay/v1/auto/messages/{contentTopic}` — drain cached messages for a
+/// subscribed content topic.
+async fn relay_messages(
+    State(s): State<AppState>,
+    Path(content_topic): Path<String>,
+) -> impl IntoResponse {
+    let messages: Vec<RestWakuMessage> = s
+        .cache
+        .drain(&content_topic)
+        .iter()
+        .map(RestWakuMessage::from_message)
+        .collect();
+    Json(messages)
+}
+
+/// `POST /lightpush/v1/message` — the node injects the message into gossipsub.
+async fn lightpush(State(s): State<AppState>, Json(req): Json<LightpushBody>) -> impl IntoResponse {
+    let content_topic = req.message.content_topic.clone();
+    let shard = match req.pubsub_topic.as_deref() {
+        Some(topic) => match ShardId::parse(topic) {
+            Ok(shard) => shard,
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        },
+        None => match ContentTopic::parse(&content_topic) {
+            Ok(ct) => autoshard(s.preset.cluster_id, &ct, s.preset.shard_count),
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        },
+    };
+    let message = match req.message.into_message(content_topic) {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
     match s.node.publish(shard, message).await {
         Ok(hash) => (StatusCode::OK, hex::encode(hash)).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
@@ -330,6 +452,31 @@ mod tests {
         // payload is base64("hello").
         assert_eq!(messages[0]["message"]["payload"], B64.encode(b"hello"));
         assert_eq!(messages[0]["message"]["contentTopic"], "/app/1/x/proto");
+    }
+
+    #[tokio::test]
+    async fn relay_cache_polls_received_messages() {
+        let state = test_state(None).await;
+        let cache = state.cache();
+        let app = router(state);
+
+        // Simulate the node receiving a message on a subscribed content topic.
+        cache.register("/app/1/x/proto".to_string());
+        cache.record(WakuMessage::new("/app/1/x/proto", b"cached".to_vec()));
+
+        let resp = app
+            .oneshot(
+                Request::get("/relay/v1/auto/messages/%2Fapp%2F1%2Fx%2Fproto")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let messages = json.as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["payload"], B64.encode(b"cached"));
     }
 
     #[tokio::test]
