@@ -81,7 +81,8 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [ ] Keystore (WAKU-RLN-KEYSTORE format).
 - [ ] On-chain group manager (`alloy`): register rate-commitment, event-sync the tree.
 - [x] Per-epoch nullifier tracking: double-signaling detection + Shamir identity-secret recovery (tested).
-- [ ] Wire as a gossipsub validator (`validate_messages()` → Accept/Reject/Ignore).
+- [x] Gossipsub validator seam: `validate_messages()` live; spec-faithful 64/WAKU2-NETWORK decision engine (timestamp window, no-proof/saturation, stale epoch, double-signal) → Accept/Reject/Ignore, reported back to the mesh. RLN enforcement behind a policy flag (off until inbound membership sync).
+- [ ] `RateLimitProof` wire codec (nwaku protobuf layout) — attach/parse proofs on the WakuMessage; needs a real nwaku vector.
 - [ ] **Gate:** bidirectional RLN proof verification with nwaku on a shared chain.
 
 **Milestone 3 — Store**

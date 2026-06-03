@@ -11,8 +11,13 @@
 //!   need a field-by-field reconciliation against go-waku's `GossipSubParams`
 //!   before we trust scoring under load — see `TODO(scoring)` below.
 //!
-//! The RLN validator seam (manual `validate_messages()` + RLN proof check) lands
-//! in Milestone 2.
+//! Manual validation is enabled (`validate_messages`): the swarm surfaces each
+//! inbound message for a verdict, which [`validation`] computes and the node
+//! reports back. The RLN proof check that feeds it lives in `waku-rln`.
+
+pub mod validation;
+
+pub use validation::{validate, MessageFacts, RlnStatus, Validation, ValidationPolicy};
 
 use std::time::Duration;
 
@@ -23,17 +28,6 @@ use thiserror::Error;
 use waku_core::{deterministic_hash, ShardId, WakuMessage};
 
 pub use waku_core::preset::RELAY_PROTOCOL_ID as PROTOCOL_ID;
-
-/// Validation outcome for an inbound relay message (gossipsub v1.1 semantics).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Validation {
-    /// Forward and (optionally) store.
-    Accept,
-    /// Drop and penalize the sender's score.
-    Reject,
-    /// Drop without penalty (e.g. no RLN proof on a saturated shard).
-    Ignore,
-}
 
 #[derive(Debug, Error)]
 pub enum RelayError {
@@ -67,6 +61,8 @@ pub fn relay_config() -> Result<gossipsub::Config, RelayError> {
         .validation_mode(ValidationMode::Anonymous)
         // THE interop-critical hook.
         .message_id_fn(waku_message_id)
+        // Manual validation: the node reports Accept/Reject/Ignore (see `validation`).
+        .validate_messages()
         // 1 MiB transmit ceiling (libp2p/go default). Waku's 150 KiB message
         // limit is enforced separately at the validation layer.
         .max_transmit_size(1024 * 1024)

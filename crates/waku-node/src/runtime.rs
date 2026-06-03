@@ -10,6 +10,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use futures::StreamExt;
+use libp2p::gossipsub::MessageAcceptance;
 use libp2p::request_response;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{gossipsub, identify, identity::Keypair, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
@@ -18,6 +19,15 @@ use tokio::sync::{mpsc, oneshot};
 use waku_core::{deterministic_hash, MessageHash, ShardId, WakuMessage, TWN};
 use waku_discv5::{Discovery, DiscoveryConfig, Key as CombinedKey, WakuEnr};
 use waku_metadata::WakuMetadata;
+use waku_relay::{validate, MessageFacts, RlnStatus, Validation, ValidationPolicy};
+
+/// Current Unix time in nanoseconds (for message timestamp validation).
+fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
 
 /// How often the discovery task runs a fresh discv5 query.
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
@@ -474,28 +484,51 @@ async fn handle_event(
             message_id,
             message,
         })) => {
-            let topic = message.topic.as_str();
-            if let (Ok(shard), Some(decoded)) = (
-                ShardId::parse(topic),
+            let topic = message.topic.as_str().to_string();
+            // Decide the validation verdict, emit to the app on Accept, then
+            // report the verdict to gossipsub so it forwards/penalizes correctly.
+            let acceptance: MessageAcceptance = match (
+                ShardId::parse(&topic),
                 WakuMessage::try_decode(&message.data),
             ) {
-                let id = message_id
-                    .0
-                    .as_slice()
-                    .try_into()
-                    .unwrap_or_else(|_| deterministic_hash(topic, &decoded));
-                evt_tx
-                    .send(Event::Message {
-                        shard,
-                        message: decoded,
-                        id,
-                        propagation_source,
-                    })
-                    .await
-                    .map_err(|_| ())?;
-            } else {
-                tracing::debug!(topic, "dropping undecodable relay message");
-            }
+                (Ok(shard), Some(decoded)) => {
+                    let facts = MessageFacts {
+                        // RLN enforcement is off until we sync a membership
+                        // tree to verify inbound proofs (so rln = Absent).
+                        timestamp_gap_secs: decoded
+                            .timestamp
+                            .map(|ts| (now_unix_nanos() - ts) / 1_000_000_000),
+                        rln: RlnStatus::Absent,
+                        shard_saturated: false,
+                    };
+                    let verdict = validate(&facts, &ValidationPolicy::default());
+                    if verdict == Validation::Accept {
+                        let id = message_id
+                            .0
+                            .as_slice()
+                            .try_into()
+                            .unwrap_or_else(|_| deterministic_hash(&topic, &decoded));
+                        evt_tx
+                            .send(Event::Message {
+                                shard,
+                                message: decoded,
+                                id,
+                                propagation_source,
+                            })
+                            .await
+                            .map_err(|_| ())?;
+                    }
+                    verdict.into()
+                }
+                _ => {
+                    tracing::debug!(topic, "rejecting undecodable relay message");
+                    Validation::Reject.into()
+                }
+            };
+            swarm
+                .behaviour_mut()
+                .relay
+                .report_message_validation_result(&message_id, &propagation_source, acceptance);
         }
         SwarmEvent::Behaviour(WakuBehaviourEvent::Metadata(request_response::Event::Message {
             peer,
