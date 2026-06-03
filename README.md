@@ -91,7 +91,8 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] Storage core: `MessageStore` trait + `sqlx` SQLite backend, hash-indexed; put/get/dedup, content-topic + time-range query with keyset cursor pagination, hashes-only mode, `exists`, time + capacity retention (tested).
 - [ ] v3 request/response protobuf wire protocol (query server + client behaviour).
 - [x] store-on-relay write path: the node persists accepted, non-ephemeral relay messages off the hot path (end-to-end test: publish → relay → store → query).
-- [ ] v3 request/response wire protocol over libp2p; Postgres backend.
+- [x] v3 request/response wire protocol (`/vac/waku/store-query/3.0.0`): LP-protobuf codec, server serves from the store, client query with request correlation (two-node over-the-wire test).
+- [ ] Postgres backend; Store-Sync (Negentropy).
 - [ ] Store-Sync (Negentropy / range-based set reconciliation).
 
 **Milestone 4 — Service protocols**

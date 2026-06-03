@@ -13,6 +13,7 @@
 //! cursor is a message hash; the server resolves it to continue the page.
 
 mod sqlite;
+pub mod store_query;
 
 pub use sqlite::SqliteStore;
 

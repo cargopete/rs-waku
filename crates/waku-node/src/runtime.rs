@@ -5,14 +5,14 @@
 //! event stream. This is the seam through which `waku-store`, `waku-rln`, the
 //! REST API, etc. will later attach.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::gossipsub::MessageAcceptance;
-use libp2p::request_response;
+use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{gossipsub, identify, identity::Keypair, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
 use thiserror::Error;
@@ -21,7 +21,12 @@ use waku_core::{deterministic_hash, MessageHash, ShardId, WakuMessage, TWN};
 use waku_discv5::{Discovery, DiscoveryConfig, Key as CombinedKey, WakuEnr};
 use waku_metadata::WakuMetadata;
 use waku_relay::{validate, MessageFacts, RlnStatus, Validation, ValidationPolicy};
+use waku_store::store_query::{self, StoreQueryRequest, StoreQueryResponse};
 use waku_store::MessageStore;
+
+/// Pending outbound store queries awaiting a response, keyed by request id.
+type PendingQueries =
+    HashMap<OutboundRequestId, oneshot::Sender<Result<StoreQueryResponse, String>>>;
 
 /// Current Unix time in nanoseconds (for message timestamp validation).
 fn now_unix_nanos() -> i64 {
@@ -41,6 +46,7 @@ pub struct WakuBehaviour {
     pub relay: gossipsub::Behaviour,
     pub identify: identify::Behaviour,
     pub metadata: waku_metadata::Behaviour,
+    pub store_query: store_query::Behaviour,
 }
 
 #[derive(Debug, Error)]
@@ -159,6 +165,11 @@ enum Command {
         addr: Multiaddr,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    StoreQuery {
+        peer: PeerId,
+        request: Box<StoreQueryRequest>,
+        reply: oneshot::Sender<Result<StoreQueryResponse, String>>,
+    },
 }
 
 /// Handle for issuing commands to a running node.
@@ -227,6 +238,26 @@ impl NodeHandle {
             .map_err(|_| NodeError::NodeStopped)?
             .map_err(NodeError::Command)
     }
+
+    /// Query a peer's 13/WAKU2-STORE v3 service.
+    pub async fn store_query(
+        &self,
+        peer: PeerId,
+        request: StoreQueryRequest,
+    ) -> Result<StoreQueryResponse, NodeError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::StoreQuery {
+                peer,
+                request: Box::new(request),
+                reply,
+            })
+            .await
+            .map_err(|_| NodeError::NodeStopped)?;
+        rx.await
+            .map_err(|_| NodeError::NodeStopped)?
+            .map_err(NodeError::Command)
+    }
 }
 
 fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
@@ -249,6 +280,7 @@ fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
                 relay,
                 identify,
                 metadata: waku_metadata::build(),
+                store_query: store_query::build(),
             })
         })
         .map_err(|e| NodeError::Build(e.to_string()))?
@@ -412,16 +444,25 @@ async fn run(
     local_meta: WakuMetadata,
     store: Option<Arc<dyn MessageStore>>,
 ) {
+    let mut pending_queries: PendingQueries = HashMap::new();
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
-                Some(cmd) => handle_command(&mut swarm, cmd),
+                Some(cmd) => handle_command(&mut swarm, cmd, &mut pending_queries),
                 None => break, // all handles dropped
             },
             event = swarm.select_next_some() => {
-                if handle_event(&mut swarm, event, &evt_tx, local_cluster, &local_meta, &store)
-                    .await
-                    .is_err()
+                if handle_event(
+                    &mut swarm,
+                    event,
+                    &evt_tx,
+                    local_cluster,
+                    &local_meta,
+                    &store,
+                    &mut pending_queries,
+                )
+                .await
+                .is_err()
                 {
                     break; // event consumer gone
                 }
@@ -430,7 +471,11 @@ async fn run(
     }
 }
 
-fn handle_command(swarm: &mut Swarm<WakuBehaviour>, cmd: Command) {
+fn handle_command(
+    swarm: &mut Swarm<WakuBehaviour>,
+    cmd: Command,
+    pending_queries: &mut PendingQueries,
+) {
     match cmd {
         Command::Subscribe { shard, reply } => {
             let topic = waku_relay::shard_topic(shard);
@@ -467,6 +512,17 @@ fn handle_command(swarm: &mut Swarm<WakuBehaviour>, cmd: Command) {
             let res = swarm.dial(addr).map_err(|e| e.to_string());
             let _ = reply.send(res);
         }
+        Command::StoreQuery {
+            peer,
+            request,
+            reply,
+        } => {
+            let id = swarm
+                .behaviour_mut()
+                .store_query
+                .send_request(&peer, *request);
+            pending_queries.insert(id, reply);
+        }
     }
 }
 
@@ -477,6 +533,7 @@ async fn handle_event(
     local_cluster: u32,
     local_meta: &WakuMetadata,
     store: &Option<Arc<dyn MessageStore>>,
+    pending_queries: &mut PendingQueries,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -576,6 +633,45 @@ async fn handle_event(
             let event = handle_metadata(swarm, peer, message, local_cluster, local_meta);
             if let Some(ev) = event {
                 evt_tx.send(ev).await.map_err(|_| ())?;
+            }
+        }
+        SwarmEvent::Behaviour(WakuBehaviourEvent::StoreQuery(
+            request_response::Event::Message { message, .. },
+        )) => match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                let response = match store {
+                    Some(s) => store_query::serve(s.as_ref(), &request).await,
+                    None => StoreQueryResponse {
+                        request_id: request.request_id.clone(),
+                        status_code: Some(503),
+                        status_desc: Some("store not enabled".into()),
+                        messages: Vec::new(),
+                        pagination_cursor: None,
+                    },
+                };
+                let _ = swarm
+                    .behaviour_mut()
+                    .store_query
+                    .send_response(channel, response);
+            }
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => {
+                if let Some(tx) = pending_queries.remove(&request_id) {
+                    let _ = tx.send(Ok(response));
+                }
+            }
+        },
+        SwarmEvent::Behaviour(WakuBehaviourEvent::StoreQuery(
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            },
+        )) => {
+            if let Some(tx) = pending_queries.remove(&request_id) {
+                let _ = tx.send(Err(error.to_string()));
             }
         }
         _ => {}
