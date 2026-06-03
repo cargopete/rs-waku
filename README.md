@@ -5,34 +5,45 @@ feature parity with [nwaku](https://github.com/waku-org/nwaku) / go-waku by
 layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 `rust-libp2p`, `sigp/discv5`, and `zerokit`.
 
-> **Status: Milestone 1 complete — connects to TWN mainnet.** `wakunode
-> --dns-discovery` resolves the live Status enrtree, discovers cluster-1 peers
-> over discv5, dials them, and completes the 66/WAKU2-METADATA handshake against
-> production nwaku nodes (they keep us connected). It relays `WakuMessage`s over
-> gossipsub with the correct Waku message-id and StrictNoSign. Next: RLN-Relay
-> (M2), needed to publish on TWN, and a formal interop pass in the simulator.
+> **Status: M1 complete (live on TWN mainnet); M2 RLN-Relay and M3 Store
+> substantially done.** A `wakunode` discovers peers via discv5/DNS, joins The
+> Waku Network mainnet, and relays `WakuMessage`s with the correct Waku
+> message-id + StrictNoSign. RLN-V2 proofs (generation/verification, nullifier
+> slashing, an inbound verifier) and a gossipsub validator seam are in; a SQLite
+> store persists accepted messages and serves 13/WAKU2-STORE v3 queries over the
+> wire. Remaining M2/M3 items either need external reference data (the RLN
+> contract, captured nwaku vectors) or are additive (Postgres, Store-Sync). Next:
+> Milestone 4 service protocols.
 
 ## What works today
 
 - **`waku-core`** — `WakuMessage` (prost, no `protoc`), the RFC-14 deterministic
   message hash, content-topic parsing, autosharding, and the TWN preset. Unit-tested.
-- **`waku-relay`** — gossipsub v1.1 configured the Waku way: `message_id` = the
-  RFC-14 hash, `ValidationMode::Anonymous` (StrictNoSign), go-libp2p mesh defaults.
+- **`waku-relay`** — gossipsub v1.1 the Waku way (`message_id` = RFC-14 hash,
+  StrictNoSign, go-libp2p mesh defaults) plus a 64/WAKU2-NETWORK validation
+  decision engine wired to manual `validate_messages()`.
 - **`waku-metadata`** — 66/WAKU2-METADATA request/response (length-prefixed
   protobuf); the node disconnects peers on a cluster-id mismatch.
 - **`waku-enr` + `waku-discv5`** — the ENR relay-shards codec (`rs`/`rsv`), a
   `sigp/discv5` wrapper that discovers peers filtered to our cluster and resolves
   each ENR to a dialable libp2p address (secp256k1 ENR → libp2p peer-id bridge),
   and an EIP-1459 `enrtree` DNS resolver (verified against the live Status tree).
-- **`waku-node`** — composes `relay + identify + metadata` into one
-  `#[derive(NetworkBehaviour)]` swarm driven by a single task; talks to the app
-  over command/event channels (`subscribe` / `publish` / `dial`); optionally runs
-  discv5 and auto-dials discovered + bootstrap peers using a shared secp256k1 key.
-- **`wakunode`** — a CLI (nwaku-style flags) that runs the above as a relay node
-  (discv5 not yet exposed on the CLI; use `--staticnode` to connect peers).
-- **Interop tests** — a two-node gossipsub loopback (received id == RFC-14 hash),
-  a metadata cluster-mismatch handshake, a discv5 session, and an end-to-end
-  *discover → dial → relay* test seeded with only a peer's ENR.
+- **`waku-rln`** — RLN-V2 via zerokit: identities, membership tree, proof
+  gen/verify + (de)serialization, per-epoch nullifier tracking with Shamir
+  double-signal recovery, and an inbound verifier (signal binding + epoch window).
+- **`waku-store`** — a `sqlx` SQLite `MessageStore` (hash-indexed, paginated
+  content-topic/time queries, retention) and the `store-query/3.0.0` request/
+  response wire protocol (server + client).
+- **`waku-node`** — composes `relay + identify + metadata + store-query` into one
+  `#[derive(NetworkBehaviour)]` swarm driven by a single task; command/event
+  channels (`subscribe`/`publish`/`dial`/`store_query`); optional discv5 with
+  auto-dial; store-on-relay persistence of accepted messages.
+- **`wakunode`** — a CLI (nwaku-style flags) running the above; `--dns-discovery`
+  joins TWN mainnet, `--staticnode` connects explicit peers.
+- **Interop tests** (15 across the workspace) — gossipsub loopback (id == RFC-14
+  hash), metadata cluster-mismatch, discv5 session, discover→dial→relay seeded
+  with only an ENR, RLN proof/nullifier/inbound-verifier, store-on-relay
+  (publish→store→query), and a two-node store query over the wire.
 
 ## Workspace
 
@@ -43,10 +54,10 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 | `waku-metadata` | 66/WAKU2-METADATA | ✅ done |
 | `waku-enr` | 31/WAKU2-ENR (relay-shards codec) | ✅ done |
 | `waku-discv5` | 33/WAKU2-DISCV5 + EIP-1459 DNS | ✅ done |
-| `waku-node` | composition / swarm driver / config | 🟡 M1 (relay+metadata+discv5) |
-| `wakunode` | node binary (nwaku-style CLI) | 🟡 M1 |
-| `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | 🟡 proofs done |
-| `waku-store` | 13/WAKU2-STORE v3 + Store-Sync | 🟡 storage core |
+| `waku-node` | composition / swarm driver / config | 🟡 relay+metadata+discv5+store |
+| `wakunode` | node binary (nwaku-style CLI) | 🟡 relay + discovery |
+| `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | 🟡 proofs+nullifier+verifier |
+| `waku-store` | 13/WAKU2-STORE v3 + Store-Sync | 🟡 core + v3 wire |
 | `waku-filter` | 12/WAKU2-FILTER v2 | ⬜ M4 |
 | `waku-lightpush` | 19/WAKU2-LIGHTPUSH v3 | ⬜ M4 |
 | `waku-peer-exchange` | 34/WAKU2-PEER-EXCHANGE | ⬜ M4 |
@@ -89,11 +100,9 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 
 **Milestone 3 — Store**
 - [x] Storage core: `MessageStore` trait + `sqlx` SQLite backend, hash-indexed; put/get/dedup, content-topic + time-range query with keyset cursor pagination, hashes-only mode, `exists`, time + capacity retention (tested).
-- [ ] v3 request/response protobuf wire protocol (query server + client behaviour).
 - [x] store-on-relay write path: the node persists accepted, non-ephemeral relay messages off the hot path (end-to-end test: publish → relay → store → query).
 - [x] v3 request/response wire protocol (`/vac/waku/store-query/3.0.0`): LP-protobuf codec, server serves from the store, client query with request correlation (two-node over-the-wire test).
-- [ ] Postgres backend; Store-Sync (Negentropy).
-- [ ] Store-Sync (Negentropy / range-based set reconciliation).
+- [ ] Postgres backend; Store-Sync (Negentropy / range-based set reconciliation).
 
 **Milestone 4 — Service protocols**
 - [ ] 12/WAKU2-FILTER v2 (filter-subscribe / filter-push, refresh ping).
