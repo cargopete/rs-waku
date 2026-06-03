@@ -206,6 +206,11 @@ impl RlnRelay {
         self.rln.get_root()
     }
 
+    /// `external_nullifier = Poseidon(epoch, rln_identifier)` for a given epoch.
+    pub fn external_nullifier(&self, epoch: u64) -> Fr {
+        poseidon_hash(&[Fr::from(epoch), self.rln_identifier])
+    }
+
     /// Generate an RLN proof that `signal` was published by the member at
     /// `index`, in `epoch`, using slot `message_id` (`0 ≤ message_id < limit`).
     pub fn prove(
@@ -260,6 +265,82 @@ impl RlnRelay {
                 &roots,
             )
             .unwrap_or(false))
+    }
+}
+
+/// Verdict for an inbound message's RLN proof.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InboundVerdict {
+    /// The proof is valid for this message and epoch; `double_signaling` is set
+    /// if its nullifier was already used with a different message this epoch.
+    Valid { double_signaling: bool },
+    /// The proof is missing, malformed, doesn't bind to the message, fails
+    /// cryptographic verification, or is outside the accepted epoch window.
+    Invalid,
+}
+
+/// Inbound-side RLN: verifies that a proof attached to a received message is
+/// valid for that message, was generated for the current epoch, and is not a
+/// double-signal. Owns the membership tree (for verification) and the per-epoch
+/// [`NullifierLog`].
+///
+/// ⚠ Epoch handling accepts the current and immediately previous epoch (a coarse
+/// stand-in for nwaku's `max_epoch_gap` seconds window — reconcile before
+/// cross-impl interop).
+pub struct RlnValidator {
+    relay: RlnRelay,
+    log: NullifierLog,
+    epoch_size_secs: u64,
+}
+
+impl RlnValidator {
+    pub fn new(relay: RlnRelay, epoch_size_secs: u64) -> Self {
+        Self {
+            relay,
+            log: NullifierLog::new(),
+            epoch_size_secs: epoch_size_secs.max(1),
+        }
+    }
+
+    /// Register a member into the membership tree used for verification.
+    pub fn register(&mut self, identity: &RlnIdentity) -> Result<usize, RlnError> {
+        self.relay.register(identity)
+    }
+
+    /// The epoch index for a wall-clock time in seconds.
+    pub fn epoch_at(&self, now_secs: u64) -> u64 {
+        now_secs / self.epoch_size_secs
+    }
+
+    /// Verify an inbound proof that should commit to `signal`, as of `now_secs`.
+    pub fn verify_inbound(
+        &mut self,
+        proof: &RlnProof,
+        signal: &[u8],
+        now_secs: u64,
+    ) -> InboundVerdict {
+        // 1. The proof must bind to *this* message's signal.
+        if proof.share().0 != hash_to_field_le(signal) {
+            return InboundVerdict::Invalid;
+        }
+        // 2. Cryptographic validity against the membership root.
+        if !self.relay.verify(proof).unwrap_or(false) {
+            return InboundVerdict::Invalid;
+        }
+        // 3. Epoch window: accept the current or immediately previous epoch.
+        let current = self.epoch_at(now_secs);
+        let ext = proof.external_nullifier();
+        let in_window = ext == self.relay.external_nullifier(current)
+            || (current > 0 && ext == self.relay.external_nullifier(current - 1));
+        if !in_window {
+            return InboundVerdict::Invalid;
+        }
+        // 4. Double-signaling check.
+        let double_signaling = matches!(
+            self.log.observe(proof),
+            Ok(NullifierOutcome::DoubleSignaling { .. })
+        );
+        InboundVerdict::Valid { double_signaling }
     }
 }
 
@@ -368,6 +449,77 @@ mod tests {
         assert_eq!(log.observe(&p0).unwrap(), NullifierOutcome::Ok);
         assert_eq!(log.observe(&p1).unwrap(), NullifierOutcome::Ok);
         assert_eq!(log.tracked_epochs(), 1);
+    }
+
+    const EPOCH_SIZE: u64 = 600;
+
+    #[test]
+    fn inbound_verifier_accepts_a_well_formed_proof() {
+        let identity = RlnIdentity::generate(100);
+        let mut relay = RlnRelay::new().expect("relay");
+        let idx = relay.register(&identity).expect("register");
+
+        let now = 600 * 100; // epoch 100
+        let epoch = now / EPOCH_SIZE;
+        let proof = relay.prove(&identity, idx, b"hi", epoch, 0).expect("prove");
+
+        let mut validator = RlnValidator::new(relay, EPOCH_SIZE);
+        assert_eq!(
+            validator.verify_inbound(&proof, b"hi", now),
+            InboundVerdict::Valid {
+                double_signaling: false
+            }
+        );
+    }
+
+    #[test]
+    fn inbound_verifier_rejects_wrong_signal_stale_epoch_and_double_signal() {
+        let identity = RlnIdentity::generate(100);
+        let mut relay = RlnRelay::new().expect("relay");
+        let idx = relay.register(&identity).expect("register");
+        let now = 600 * 100;
+        let epoch = now / EPOCH_SIZE;
+
+        let proof = relay
+            .prove(&identity, idx, b"real", epoch, 0)
+            .expect("prove");
+        // A proof generated for a long-past epoch.
+        let stale = relay
+            .prove(&identity, idx, b"old", epoch - 50, 1)
+            .expect("prove");
+        // Two proofs reusing slot 0 in this epoch with different signals.
+        let dup_a = relay
+            .prove(&identity, idx, b"spam one", epoch, 0)
+            .expect("prove");
+        let dup_b = relay
+            .prove(&identity, idx, b"spam two", epoch, 0)
+            .expect("prove");
+
+        let mut validator = RlnValidator::new(relay, EPOCH_SIZE);
+
+        // Proof doesn't bind to the claimed signal.
+        assert_eq!(
+            validator.verify_inbound(&proof, b"forged", now),
+            InboundVerdict::Invalid
+        );
+        // Out of the epoch window.
+        assert_eq!(
+            validator.verify_inbound(&stale, b"old", now),
+            InboundVerdict::Invalid
+        );
+        // First use ok, second use in the same slot is flagged as double-signaling.
+        assert_eq!(
+            validator.verify_inbound(&dup_a, b"spam one", now),
+            InboundVerdict::Valid {
+                double_signaling: false
+            }
+        );
+        assert_eq!(
+            validator.verify_inbound(&dup_b, b"spam two", now),
+            InboundVerdict::Valid {
+                double_signaling: true
+            }
+        );
     }
 
     #[test]
