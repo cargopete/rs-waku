@@ -19,6 +19,10 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use waku_core::{deterministic_hash, MessageHash, ShardId, WakuMessage, TWN};
 use waku_discv5::{Discovery, DiscoveryConfig, Key as CombinedKey, WakuEnr};
+use waku_filter::{
+    self, subscribe_type, FilterPushResponse, FilterSubscribeRequest, FilterSubscribeResponse,
+    MessagePush,
+};
 use waku_lightpush::{LightpushRequest, LightpushResponse};
 use waku_metadata::WakuMetadata;
 use waku_peer_exchange::{self, PeerExchangeRpc};
@@ -32,6 +36,77 @@ struct Pending {
     store_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<StoreQueryResponse, String>>>,
     lightpush: HashMap<OutboundRequestId, oneshot::Sender<Result<LightpushResponse, String>>>,
     peer_exchange: HashMap<OutboundRequestId, oneshot::Sender<Result<PeerExchangeRpc, String>>>,
+    filter: HashMap<OutboundRequestId, oneshot::Sender<Result<FilterSubscribeResponse, String>>>,
+}
+
+/// A light client's content filter (12/WAKU2-FILTER): which pubsub topic and
+/// content topics it wants pushed (empty content topics = all on that topic).
+#[derive(Clone, Debug)]
+struct FilterSub {
+    pubsub_topic: Option<String>,
+    content_topics: Vec<String>,
+}
+
+impl FilterSub {
+    fn matches(&self, topic: &str, content_topic: &str) -> bool {
+        let topic_ok = self.pubsub_topic.as_deref().is_none_or(|t| t == topic);
+        let ct_ok = self.content_topics.is_empty()
+            || self.content_topics.iter().any(|c| c == content_topic);
+        topic_ok && ct_ok
+    }
+}
+
+/// Per-peer filter subscriptions this (full) node serves.
+type FilterRegistry = HashMap<PeerId, Vec<FilterSub>>;
+
+/// Apply a filter-subscribe request to the registry and build the ack.
+fn apply_filter_request(
+    filters: &mut FilterRegistry,
+    peer: PeerId,
+    req: &FilterSubscribeRequest,
+) -> FilterSubscribeResponse {
+    match req.filter_subscribe_type {
+        subscribe_type::SUBSCRIBE => {
+            filters.entry(peer).or_default().push(FilterSub {
+                pubsub_topic: req.pubsub_topic.clone(),
+                content_topics: req.content_topics.clone(),
+            });
+        }
+        subscribe_type::UNSUBSCRIBE => {
+            if let Some(subs) = filters.get_mut(&peer) {
+                subs.retain(|s| {
+                    s.pubsub_topic != req.pubsub_topic || s.content_topics != req.content_topics
+                });
+            }
+        }
+        subscribe_type::UNSUBSCRIBE_ALL => {
+            filters.remove(&peer);
+        }
+        subscribe_type::PING => {}
+        _ => return FilterSubscribeResponse::error(req.request_id.clone(), 400, "unknown type"),
+    }
+    FilterSubscribeResponse::ok(req.request_id.clone())
+}
+
+/// Push a message to every subscriber whose filter matches it (filter-push).
+fn push_filter_matches(
+    swarm: &mut Swarm<WakuBehaviour>,
+    filters: &FilterRegistry,
+    topic: &str,
+    msg: &WakuMessage,
+) {
+    let targets: Vec<PeerId> = filters
+        .iter()
+        .filter(|(_, subs)| subs.iter().any(|s| s.matches(topic, &msg.content_topic)))
+        .map(|(peer, _)| *peer)
+        .collect();
+    for peer in targets {
+        let push = MessagePush {
+            waku_message: Some(msg.clone()),
+            pubsub_topic: Some(topic.to_string()),
+        };
+        swarm.behaviour_mut().filter_push.send_request(&peer, push);
+    }
 }
 
 /// Cap on the ENRs we keep for serving peer-exchange.
@@ -73,6 +148,8 @@ pub struct WakuBehaviour {
     pub store_query: store_query::Behaviour,
     pub lightpush: waku_lightpush::Behaviour,
     pub peer_exchange: waku_peer_exchange::Behaviour,
+    pub filter_subscribe: waku_filter::SubscribeBehaviour,
+    pub filter_push: waku_filter::PushBehaviour,
 }
 
 #[derive(Debug, Error)]
@@ -175,6 +252,11 @@ pub enum Event {
         id: MessageHash,
         propagation_source: PeerId,
     },
+    /// A message delivered to us via 12/WAKU2-FILTER filter-push (as a client).
+    FilterMessage {
+        pubsub_topic: Option<String>,
+        message: WakuMessage,
+    },
 }
 
 enum Command {
@@ -205,6 +287,11 @@ enum Command {
         peer: PeerId,
         num_peers: u64,
         reply: oneshot::Sender<Result<PeerExchangeRpc, String>>,
+    },
+    FilterSubscribe {
+        peer: PeerId,
+        request: Box<FilterSubscribeRequest>,
+        reply: oneshot::Sender<Result<FilterSubscribeResponse, String>>,
     },
 }
 
@@ -347,6 +434,67 @@ impl NodeHandle {
             .filter_map(|b| waku_discv5::enr_from_bytes(b))
             .collect())
     }
+
+    /// Subscribe to a content filter on `peer` (12/WAKU2-FILTER). Matching
+    /// messages arrive as [`Event::FilterMessage`]. Empty `content_topics`
+    /// matches all content on the topic.
+    pub async fn filter_subscribe(
+        &self,
+        peer: PeerId,
+        pubsub_topic: impl Into<String>,
+        content_topics: Vec<String>,
+    ) -> Result<FilterSubscribeResponse, NodeError> {
+        self.filter_request(
+            peer,
+            subscribe_type::SUBSCRIBE,
+            Some(pubsub_topic.into()),
+            content_topics,
+        )
+        .await
+    }
+
+    /// Remove a content filter previously installed on `peer`.
+    pub async fn filter_unsubscribe(
+        &self,
+        peer: PeerId,
+        pubsub_topic: impl Into<String>,
+        content_topics: Vec<String>,
+    ) -> Result<FilterSubscribeResponse, NodeError> {
+        self.filter_request(
+            peer,
+            subscribe_type::UNSUBSCRIBE,
+            Some(pubsub_topic.into()),
+            content_topics,
+        )
+        .await
+    }
+
+    async fn filter_request(
+        &self,
+        peer: PeerId,
+        kind: i32,
+        pubsub_topic: Option<String>,
+        content_topics: Vec<String>,
+    ) -> Result<FilterSubscribeResponse, NodeError> {
+        let (reply, rx) = oneshot::channel();
+        let request = FilterSubscribeRequest {
+            request_id: String::new(),
+            filter_subscribe_type: kind,
+            pubsub_topic,
+            content_topics,
+        };
+        self.cmd_tx
+            .send(Command::FilterSubscribe {
+                peer,
+                request: Box::new(request),
+                reply,
+            })
+            .await
+            .map_err(|_| NodeError::NodeStopped)?;
+        rx.await
+            .map_err(|_| NodeError::NodeStopped)?
+            .map_err(NodeError::Command)
+    }
 }
 
 fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
@@ -372,6 +520,8 @@ fn build_swarm(config: &NodeConfig) -> Result<Swarm<WakuBehaviour>, NodeError> {
                 store_query: store_query::build(),
                 lightpush: waku_lightpush::build(),
                 peer_exchange: waku_peer_exchange::build(),
+                filter_subscribe: waku_filter::build_subscribe(),
+                filter_push: waku_filter::build_push(),
             })
         })
         .map_err(|e| NodeError::Build(e.to_string()))?
@@ -548,6 +698,7 @@ async fn run(
     peer_book: PeerBook,
 ) {
     let mut pending = Pending::default();
+    let mut filters: FilterRegistry = HashMap::new();
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
@@ -564,6 +715,7 @@ async fn run(
                     &store,
                     &mut pending,
                     &peer_book,
+                    &mut filters,
                 )
                 .await
                 .is_err()
@@ -645,6 +797,17 @@ fn handle_command(swarm: &mut Swarm<WakuBehaviour>, cmd: Command, pending: &mut 
                 .send_request(&peer, PeerExchangeRpc::query(num_peers));
             pending.peer_exchange.insert(id, reply);
         }
+        Command::FilterSubscribe {
+            peer,
+            request,
+            reply,
+        } => {
+            let id = swarm
+                .behaviour_mut()
+                .filter_subscribe
+                .send_request(&peer, *request);
+            pending.filter.insert(id, reply);
+        }
     }
 }
 
@@ -658,6 +821,7 @@ async fn handle_event(
     store: &Option<Arc<dyn MessageStore>>,
     pending: &mut Pending,
     peer_book: &PeerBook,
+    filters: &mut FilterRegistry,
 ) -> Result<(), ()> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -722,6 +886,9 @@ async fn handle_event(
                                 });
                             }
                         }
+                        // Push to any filter subscribers whose filter matches.
+                        push_filter_matches(swarm, filters, &topic, &decoded);
+
                         let id = message_id
                             .0
                             .as_slice()
@@ -864,6 +1031,61 @@ async fn handle_event(
             if let Some(tx) = pending.peer_exchange.remove(&request_id) {
                 let _ = tx.send(Err(error.to_string()));
             }
+        }
+        // filter-subscribe: we are the full node; update the registry and ack.
+        SwarmEvent::Behaviour(WakuBehaviourEvent::FilterSubscribe(
+            request_response::Event::Message { peer, message, .. },
+        )) => match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                let response = apply_filter_request(filters, peer, &request);
+                let _ = swarm
+                    .behaviour_mut()
+                    .filter_subscribe
+                    .send_response(channel, response);
+            }
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => {
+                if let Some(tx) = pending.filter.remove(&request_id) {
+                    let _ = tx.send(Ok(response));
+                }
+            }
+        },
+        SwarmEvent::Behaviour(WakuBehaviourEvent::FilterSubscribe(
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            },
+        )) => {
+            if let Some(tx) = pending.filter.remove(&request_id) {
+                let _ = tx.send(Err(error.to_string()));
+            }
+        }
+        // filter-push: we are the client; surface the message and ack.
+        SwarmEvent::Behaviour(WakuBehaviourEvent::FilterPush(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            },
+        )) => {
+            if let Some(m) = request.waku_message {
+                evt_tx
+                    .send(Event::FilterMessage {
+                        pubsub_topic: request.pubsub_topic,
+                        message: m,
+                    })
+                    .await
+                    .map_err(|_| ())?;
+            }
+            let _ = swarm
+                .behaviour_mut()
+                .filter_push
+                .send_response(channel, FilterPushResponse { status_code: 200 });
         }
         _ => {}
     }

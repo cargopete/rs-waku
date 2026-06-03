@@ -4910,6 +4910,10 @@ dependencies = [
 name = "waku-filter"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "futures",
+ "libp2p",
+ "prost",
  "waku-core",
 ]
 

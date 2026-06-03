@@ -11,9 +11,10 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 > message-id + StrictNoSign. RLN-V2 proofs (generation/verification, nullifier
 > slashing, an inbound verifier) and a gossipsub validator seam are in; a SQLite
 > store persists accepted messages and serves 13/WAKU2-STORE v3 queries over the
-> wire. Remaining M2/M3 items either need external reference data (the RLN
+> wire. Milestone 4 service protocols (Light Push v3, Peer Exchange, Filter v2)
+> are done too. Remaining items either need external reference data (the RLN
 > contract, captured nwaku vectors) or are additive (Postgres, Store-Sync). Next:
-> Milestone 4 service protocols.
+> Milestone 5 — the nwaku-compatible REST API.
 
 ## What works today
 
@@ -34,16 +35,23 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 - **`waku-store`** — a `sqlx` SQLite `MessageStore` (hash-indexed, paginated
   content-topic/time queries, retention) and the `store-query/3.0.0` request/
   response wire protocol (server + client).
-- **`waku-node`** — composes `relay + identify + metadata + store-query` into one
+- **`waku-lightpush` / `waku-peer-exchange` / `waku-filter`** — Light Push v3
+  (publish via a full node), Peer Exchange (ask a peer for ENRs), and Filter v2
+  (content-filtered push), all req/resp over LP-protobuf.
+- **`waku-node`** — composes **eight** behaviours (relay, identify, metadata,
+  store-query, lightpush, peer-exchange, filter-subscribe, filter-push) into one
   `#[derive(NetworkBehaviour)]` swarm driven by a single task; command/event
-  channels (`subscribe`/`publish`/`dial`/`store_query`); optional discv5 with
-  auto-dial; store-on-relay persistence of accepted messages.
+  channels (`subscribe`/`publish`/`dial`/`store_query`/`light_push`/
+  `peer_exchange`/`filter_subscribe`); optional discv5 with auto-dial; store-on-relay
+  persistence; a peer-book served via peer-exchange; a filter registry that
+  pushes matching messages to subscribers.
 - **`wakunode`** — a CLI (nwaku-style flags) running the above; `--dns-discovery`
   joins TWN mainnet, `--staticnode` connects explicit peers.
-- **Interop tests** (15 across the workspace) — gossipsub loopback (id == RFC-14
-  hash), metadata cluster-mismatch, discv5 session, discover→dial→relay seeded
-  with only an ENR, RLN proof/nullifier/inbound-verifier, store-on-relay
-  (publish→store→query), and a two-node store query over the wire.
+- **Interop tests** — gossipsub loopback (id == RFC-14 hash), metadata
+  cluster-mismatch, discv5 session, discover→dial→relay seeded with only an ENR,
+  RLN proof/nullifier/inbound-verifier, store-on-relay (publish→store→query),
+  store query over the wire, light-push relay (B→A→C), peer-exchange, and
+  filter-push (C→A→push→B).
 
 ## Workspace
 
@@ -58,7 +66,7 @@ layering each Waku protocol as a libp2p `NetworkBehaviour` on top of
 | `wakunode` | node binary (nwaku-style CLI) | 🟡 relay + discovery |
 | `waku-rln` | 17/WAKU2-RLN-RELAY (RLN-V2) | 🟡 proofs+nullifier+verifier |
 | `waku-store` | 13/WAKU2-STORE v3 + Store-Sync | 🟡 core + v3 wire |
-| `waku-filter` | 12/WAKU2-FILTER v2 | ⬜ M4 |
+| `waku-filter` | 12/WAKU2-FILTER v2 | ✅ done |
 | `waku-lightpush` | 19/WAKU2-LIGHTPUSH v3 | ✅ done |
 | `waku-peer-exchange` | 34/WAKU2-PEER-EXCHANGE | ✅ done |
 | `waku-rest` | nwaku-compatible REST API (port 8645) | ⬜ M5 |
@@ -104,8 +112,8 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] v3 request/response wire protocol (`/vac/waku/store-query/3.0.0`): LP-protobuf codec, server serves from the store, client query with request correlation (two-node over-the-wire test).
 - [ ] Postgres backend; Store-Sync (Negentropy / range-based set reconciliation).
 
-**Milestone 4 — Service protocols**
-- [ ] 12/WAKU2-FILTER v2 (filter-subscribe / filter-push, refresh ping).
+**Milestone 4 — Service protocols** ✅
+- [x] 12/WAKU2-FILTER v2: filter-subscribe + filter-push; full node tracks per-peer content filters and pushes matching relay messages (3-node C→A→push→B test).
 - [x] 19/WAKU2-LIGHTPUSH v3: LP-protobuf req/resp; full node publishes the pushed message into gossipsub and reports relay-peer count; client `light_push` (3-node B→A→C delivery test).
 - [x] 34/WAKU2-PEER-EXCHANGE: LP-protobuf req/resp; node serves ENRs from a shared peer-book (populated by discovery/bootstrap); client `peer_exchange` (over-the-wire test).
 

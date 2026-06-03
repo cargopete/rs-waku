@@ -161,6 +161,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bytes = message.payload.len(),
                     "relayed message",
                 ),
+                Some(Event::FilterMessage { message, .. }) => tracing::info!(
+                    content_topic = %message.content_topic,
+                    bytes = message.payload.len(),
+                    "filter-push message",
+                ),
                 Some(Event::PeerConnected(p)) => tracing::info!(peer = %p, "peer connected"),
                 Some(Event::PeerDisconnected(p)) => tracing::debug!(peer = %p, "peer disconnected"),
                 Some(Event::MetadataMismatch { peer, theirs }) => tracing::warn!(
