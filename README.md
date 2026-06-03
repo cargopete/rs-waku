@@ -194,7 +194,21 @@ docker build -t rs-waku .
 docker run -p 8645:8645 -p 60000:60000 -v rs-waku-data:/data rs-waku
 ```
 
-Key flags (mirroring nwaku): `--cluster-id`, `--shard` (repeatable; empty = all
+Or drive everything from a TOML config file (CLI flags override file values):
+
+```sh
+cat > waku.toml <<EOF
+tcp-port = 60000
+dns-discovery = true
+store-path = "./store.db"
+node-key-file = "./node.key"
+rest-port = 8645
+max-connections = 512
+EOF
+cargo run -p wakunode -- --config waku.toml
+```
+
+Key flags (mirroring nwaku): `--config` (TOML), `--cluster-id`, `--shard` (repeatable; empty = all
 shards), `--tcp-port`, `--staticnode` (repeatable), `--discv5-discovery`,
 `--discv5-udp-port`, `--ext-ip`, `--discv5-bootstrap-node` (repeatable),
 `--dns-discovery`, `--dns-discovery-url` (repeatable), `--store`, `--store-path`,

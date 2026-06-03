@@ -1,9 +1,11 @@
 //! `wakunode` — the rs-waku node binary.
 //!
 //! The CLI deliberately mirrors nwaku's flag semantics so operators and the
-//! interop suite can drive it interchangeably. Milestone 1: it stands up the
-//! libp2p swarm, subscribes to the configured shards, dials any static peers,
-//! and relays. RLN/store/filter/lightpush land in later milestones.
+//! interop suite can drive it interchangeably; a `--config <file>` (TOML) fills
+//! in any flags left unset. RLN enforcement against an on-chain membership is
+//! the remaining milestone.
+
+mod config;
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -11,6 +13,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use clap::Parser;
+use config::FileConfig;
 use libp2p::identity::Keypair;
 use libp2p::Multiaddr;
 use waku_core::{ShardId, TWN};
@@ -21,25 +24,25 @@ use waku_store::{MessageStore, SqliteStore};
 #[derive(Parser, Debug)]
 #[command(name = "wakunode", version, about)]
 struct Cli {
+    /// TOML config file; its values fill in any flag left unset (CLI wins).
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Cluster id (TWN mainnet = 1).
-    #[arg(long, default_value_t = 1)]
-    cluster_id: u16,
+    #[arg(long)]
+    cluster_id: Option<u16>,
 
     /// Shard to subscribe to; repeatable. Empty ⇒ all shards in the cluster.
     #[arg(long = "shard")]
     shards: Vec<u16>,
 
     /// TCP port to listen on (0 = ephemeral; a fixed port is required for discv5).
-    #[arg(long = "tcp-port", default_value_t = 60000)]
-    tcp_port: u16,
+    #[arg(long = "tcp-port")]
+    tcp_port: Option<u16>,
 
     /// Static peer multiaddr to dial; repeatable.
     #[arg(long = "staticnode")]
     staticnodes: Vec<Multiaddr>,
-
-    /// Enable 11/WAKU2-RELAY.
-    #[arg(long, default_value_t = true)]
-    relay: bool,
 
     /// Enable 17/WAKU2-RLN-RELAY (not yet implemented).
     #[arg(long = "rln-relay", default_value_t = false)]
@@ -50,12 +53,12 @@ struct Cli {
     discv5: bool,
 
     /// UDP port for discv5.
-    #[arg(long = "discv5-udp-port", default_value_t = 9000)]
-    discv5_udp_port: u16,
+    #[arg(long = "discv5-udp-port")]
+    discv5_udp_port: Option<u16>,
 
     /// Externally reachable IPv4 to advertise in our ENR.
-    #[arg(long = "ext-ip", default_value = "127.0.0.1")]
-    ext_ip: Ipv4Addr,
+    #[arg(long = "ext-ip")]
+    ext_ip: Option<Ipv4Addr>,
 
     /// discv5 bootstrap node ENR (`enr:...`); repeatable.
     #[arg(long = "discv5-bootstrap-node")]
@@ -78,12 +81,12 @@ struct Cli {
     rest_port: Option<u16>,
 
     /// Maximum total established connections (DoS guard).
-    #[arg(long = "max-connections", default_value_t = 300)]
-    max_connections: u32,
+    #[arg(long = "max-connections")]
+    max_connections: Option<u32>,
 
     /// Max concurrent connections from a single IP (0 = unlimited).
-    #[arg(long = "ip-colocation-limit", default_value_t = 20)]
-    ip_colocation_limit: usize,
+    #[arg(long = "ip-colocation-limit")]
+    ip_colocation_limit: Option<usize>,
 
     /// Persist the message store to this SQLite file (default: in-memory).
     #[arg(long = "store-path")]
@@ -130,41 +133,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    let file = FileConfig::load(cli.config.as_deref())?;
+
+    // Resolve each setting: CLI flag > config file > built-in default.
+    let cluster_id = cli.cluster_id.or(file.cluster_id).unwrap_or(TWN.cluster_id);
+    let tcp_port = cli.tcp_port.or(file.tcp_port).unwrap_or(60000);
+    let discv5_udp_port = cli.discv5_udp_port.or(file.discv5_udp_port).unwrap_or(9000);
+    let ext_ip = cli
+        .ext_ip
+        .or_else(|| file.ext_ip.as_deref().and_then(|s| s.parse().ok()))
+        .unwrap_or(Ipv4Addr::LOCALHOST);
+    let max_connections = cli.max_connections.or(file.max_connections).unwrap_or(300);
+    let ip_colocation_limit = cli
+        .ip_colocation_limit
+        .or(file.ip_colocation_limit)
+        .unwrap_or(20);
+    let discv5 = cli.discv5 || file.discv5_discovery.unwrap_or(false);
+    let dns_discovery = cli.dns_discovery || file.dns_discovery.unwrap_or(false);
+    let store_enabled = cli.store || file.store.unwrap_or(false);
+    let store_path = cli.store_path.clone().or(file.store_path.clone());
+    let node_key_file = cli.node_key_file.clone().or(file.node_key_file.clone());
+    let rest_port = cli.rest_port.or(file.rest_port);
+    let shard_src = if !cli.shards.is_empty() {
+        cli.shards.clone()
+    } else {
+        file.shard.clone()
+    };
+    let staticnodes: Vec<Multiaddr> = if !cli.staticnodes.is_empty() {
+        cli.staticnodes.clone()
+    } else {
+        file.staticnode
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    };
+    let bootstrap_enrs = if !cli.bootstrap_enrs.is_empty() {
+        cli.bootstrap_enrs.clone()
+    } else {
+        file.discv5_bootstrap_node.clone()
+    };
+    let dns_discovery_urls = if !cli.dns_discovery_urls.is_empty() {
+        cli.dns_discovery_urls.clone()
+    } else {
+        file.dns_discovery_url.clone()
+    };
+
     if cli.rln_relay {
         tracing::warn!("--rln-relay requested but RLN is Milestone 2; running without it");
     }
-    if cli.cluster_id != TWN.cluster_id {
+    if cluster_id != TWN.cluster_id {
         tracing::warn!(
-            cli.cluster_id,
+            cluster_id,
             "only the TWN preset (cluster 1) is wired so far"
         );
     }
 
-    let shards: Vec<u16> = if cli.shards.is_empty() {
+    let shards: Vec<u16> = if shard_src.is_empty() {
         (0..TWN.shard_count).collect()
     } else {
-        cli.shards.clone()
+        shard_src
     };
 
-    let listen: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", cli.tcp_port).parse()?;
+    let listen: Multiaddr = format!("/ip4/0.0.0.0/tcp/{tcp_port}").parse()?;
     let mut config = NodeConfig::new()
         .with_listen_addr(listen)
-        .with_cluster(cli.cluster_id, shards.clone());
-    config.max_connections = cli.max_connections;
-    config.ip_colocation_limit = cli.ip_colocation_limit;
-    if let Some(path) = &cli.node_key_file {
+        .with_cluster(cluster_id, shards.clone());
+    config.max_connections = max_connections;
+    config.ip_colocation_limit = ip_colocation_limit;
+    if let Some(path) = &node_key_file {
         config.keypair = load_or_create_key(path)?;
         tracing::info!(path = %path.display(), "loaded persistent node identity");
     }
 
     // Assemble discovery settings if any discovery mechanism was requested.
-    let want_discovery = cli.discv5 || cli.dns_discovery || !cli.bootstrap_enrs.is_empty();
+    let want_discovery = discv5 || dns_discovery || !bootstrap_enrs.is_empty();
     if want_discovery {
-        if cli.tcp_port == 0 {
+        if tcp_port == 0 {
             tracing::warn!("discv5 advertises --tcp-port; using 0 makes us undialable");
         }
-        let bootstrap = cli
-            .bootstrap_enrs
+        let bootstrap = bootstrap_enrs
             .iter()
             .filter_map(|s| match WakuEnr::from_str(s) {
                 Ok(enr) => Some(enr),
@@ -174,26 +221,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
             .collect();
-        let dns_bootstrap = if cli.dns_discovery && cli.dns_discovery_urls.is_empty() {
+        let dns_bootstrap = if dns_discovery && dns_discovery_urls.is_empty() {
             vec![TWN.dns_discovery_enrtree.to_string()]
         } else {
-            cli.dns_discovery_urls.clone()
+            dns_discovery_urls.clone()
         };
         config.discovery = Some(DiscoverySettings {
-            udp_port: cli.discv5_udp_port,
-            advertised_ip: cli.ext_ip,
-            advertised_tcp_port: cli.tcp_port,
+            udp_port: discv5_udp_port,
+            advertised_ip: ext_ip,
+            advertised_tcp_port: tcp_port,
             bootstrap,
             dns_bootstrap,
         });
     }
 
     // Optional message store (needed for store-on-relay and the REST store API).
-    let store: Option<Arc<dyn MessageStore>> = if let Some(path) = &cli.store_path {
+    let store: Option<Arc<dyn MessageStore>> = if let Some(path) = &store_path {
         Some(Arc::new(
             SqliteStore::connect(&format!("sqlite:{path}")).await?,
         ))
-    } else if cli.store || cli.rest_port.is_some() {
+    } else if store_enabled || rest_port.is_some() {
         Some(Arc::new(SqliteStore::in_memory().await?))
     } else {
         None
@@ -205,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The relay message cache feeds `GET /relay/v1/auto/messages/{ct}`.
     let mut rest_cache: Option<waku_rest::MessageCache> = None;
-    if let Some(port) = cli.rest_port {
+    if let Some(port) = rest_port {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
         let state = waku_rest::AppState::new(node.clone(), store.clone());
         rest_cache = Some(state.cache());
@@ -221,12 +268,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for shard in &shards {
-        let s = ShardId::new(cli.cluster_id, *shard);
+        let s = ShardId::new(cluster_id, *shard);
         node.subscribe(s).await?;
         tracing::info!(topic = %s.pubsub_topic(), "subscribed");
     }
 
-    for addr in &cli.staticnodes {
+    for addr in &staticnodes {
         match node.dial(addr.clone()).await {
             Ok(()) => tracing::info!(%addr, "dialing static node"),
             Err(e) => tracing::warn!(%addr, error = %e, "failed to dial static node"),
