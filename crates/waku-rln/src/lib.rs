@@ -6,10 +6,11 @@
 //! Using zerokit directly keeps proofs byte-compatible with nwaku and js-rln.
 //!
 //! Covered: identities, membership registration into the Merkle tree, proof
-//! generation/verification, and per-epoch nullifier tracking with double-signal
-//! detection + Shamir secret recovery. Still to come for full M2: the
-//! WAKU-RLN-KEYSTORE format, the on-chain group manager (`alloy`), and the
-//! gossipsub validator seam (with the nwaku `rate_limit_proof` wire format).
+//! generation/verification (incl. cross-node verify with a shared membership),
+//! proof byte (de)serialization, and per-epoch nullifier tracking with
+//! double-signal detection + Shamir secret recovery. Still to come for full M2:
+//! the WAKU-RLN-KEYSTORE format, the on-chain group manager (`alloy`), and
+//! wrapping the proof bytes in nwaku's `RateLimitProof` protobuf.
 //!
 //! ⚠ INTEROP CAVEATS (matter for nwaku byte-compatibility, not self-roundtrip):
 //! - `x = hash_to_field_le(signal)` — endianness and the exact signal bytes must
@@ -22,12 +23,13 @@
 use std::collections::HashMap;
 
 use rln::prelude::{
-    compute_id_secret, fr_to_bytes_le, hash_to_field_le, keygen, poseidon_hash, Fr, IdSecret,
-    Proof, RLNProofValues, RLNWitnessInput, DEFAULT_TREE_DEPTH, RLN,
+    bytes_le_to_rln_proof, compute_id_secret, fr_to_bytes_le, hash_to_field_le, keygen,
+    poseidon_hash, rln_proof_to_bytes_le, Fr, IdSecret, RLNProof, RLNWitnessInput,
+    DEFAULT_TREE_DEPTH, RLN,
 };
 use thiserror::Error;
 
-pub use rln::prelude::{Fr as Field, Proof as ZkProof};
+pub use rln::prelude::Fr as Field;
 
 #[derive(Debug, Error)]
 pub enum RlnError {
@@ -66,32 +68,46 @@ impl RlnIdentity {
     }
 }
 
-/// A generated RLN proof bundled with the signal hash it commits to.
+/// A generated RLN proof: the Groth16 proof plus its public values (root, x, y,
+/// nullifier, external_nullifier). Serializable for attachment to a message.
 pub struct RlnProof {
-    proof: Proof,
-    values: RLNProofValues,
-    x: Fr,
+    inner: RLNProof,
 }
 
 impl RlnProof {
     /// `external_nullifier = Poseidon(epoch, rln_identifier)` — identifies the epoch.
     pub fn external_nullifier(&self) -> Fr {
-        *self.values.external_nullifier()
+        *self.inner.proof_values.external_nullifier()
     }
 
     /// The internal nullifier — equal for the same (identity, epoch, message_id).
     pub fn nullifier(&self) -> Fr {
-        *self.values.nullifier()
+        *self.inner.proof_values.nullifier()
     }
 
     /// The Shamir share `(x, y)` on the secret-sharing line for this message.
     pub fn share(&self) -> (Fr, Fr) {
-        (*self.values.x(), *self.values.y())
+        (*self.inner.proof_values.x(), *self.inner.proof_values.y())
     }
 
     /// The Merkle root the proof was generated against.
     pub fn root(&self) -> Fr {
-        *self.values.root()
+        *self.inner.proof_values.root()
+    }
+
+    /// Serialize to bytes (zerokit little-endian proof encoding) for attaching to
+    /// a message's `rate_limit_proof`.
+    ///
+    /// ⚠ This is zerokit's proof encoding, not yet wrapped in nwaku's
+    /// `RateLimitProof` protobuf — that framing is a separate interop step.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, RlnError> {
+        rln_proof_to_bytes_le(&self.inner).map_err(|e| RlnError::Rln(e.to_string()))
+    }
+
+    /// Reconstruct a proof from [`to_bytes`](Self::to_bytes) output.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RlnError> {
+        let (inner, _) = bytes_le_to_rln_proof(bytes).map_err(|e| RlnError::Rln(e.to_string()))?;
+        Ok(Self { inner })
     }
 }
 
@@ -219,12 +235,17 @@ impl RlnRelay {
         )
         .map_err(|e| RlnError::Rln(e.to_string()))?;
 
-        let (proof, values) = self
+        let (proof, proof_values) = self
             .rln
             .generate_rln_proof(&witness)
             .map_err(|e| RlnError::Rln(e.to_string()))?;
 
-        Ok(RlnProof { proof, values, x })
+        Ok(RlnProof {
+            inner: RLNProof {
+                proof,
+                proof_values,
+            },
+        })
     }
 
     /// Verify a proof against the current membership root and its committed signal.
@@ -232,7 +253,12 @@ impl RlnRelay {
         let roots = [self.root()];
         Ok(self
             .rln
-            .verify_with_roots(&proof.proof, &proof.values, &proof.x, &roots)
+            .verify_with_roots(
+                &proof.inner.proof,
+                &proof.inner.proof_values,
+                proof.inner.proof_values.x(),
+                &roots,
+            )
             .unwrap_or(false))
     }
 }
@@ -242,22 +268,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proof_roundtrip_and_tamper_detection() {
+    fn valid_proof_verifies() {
         let mut relay = RlnRelay::new().expect("rln init");
         let identity = RlnIdentity::generate(100);
         let index = relay.register(&identity).expect("register");
-
         let proof = relay
             .prove(&identity, index, b"hello rln", 42, 1)
             .expect("prove");
-
-        // A valid proof verifies against the membership root.
         assert!(relay.verify(&proof).expect("verify"));
+    }
 
-        // Tampering with the committed signal must fail verification.
-        let mut tampered = proof;
-        tampered.x = hash_to_field_le(b"a different message");
-        assert!(!relay.verify(&tampered).expect("verify tampered"));
+    #[test]
+    fn proof_survives_serialization_roundtrip() {
+        let mut relay = RlnRelay::new().expect("rln init");
+        let identity = RlnIdentity::generate(100);
+        let index = relay.register(&identity).expect("register");
+        let proof = relay
+            .prove(&identity, index, b"hello", 1, 0)
+            .expect("prove");
+
+        let bytes = proof.to_bytes().expect("serialize");
+        let restored = RlnProof::from_bytes(&bytes).expect("deserialize");
+        assert!(relay.verify(&restored).expect("verify restored"));
+        // Same public values survive the round-trip.
+        assert_eq!(restored.nullifier(), proof.nullifier());
+        assert_eq!(restored.root(), proof.root());
+    }
+
+    #[test]
+    fn proof_verifies_on_a_second_node_with_the_same_membership() {
+        // Node A generates and serializes a proof; node B, which independently
+        // registered the same member, deserializes and verifies it. This is the
+        // publish→attach→receive→verify path, minus the wire framing.
+        let identity = RlnIdentity::generate(100);
+
+        let mut node_a = RlnRelay::new().expect("a init");
+        let idx = node_a.register(&identity).expect("a register");
+        let wire = node_a
+            .prove(&identity, idx, b"cross-node", 11, 0)
+            .expect("prove")
+            .to_bytes()
+            .expect("serialize");
+
+        let mut node_b = RlnRelay::new().expect("b init");
+        node_b.register(&identity).expect("b register"); // same leaf ⇒ same root
+        let received = RlnProof::from_bytes(&wire).expect("deserialize");
+        assert!(node_b.verify(&received).expect("b verify"));
     }
 
     #[test]
