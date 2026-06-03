@@ -233,10 +233,11 @@ async fn version(State(s): State<AppState>) -> String {
     s.version
 }
 
-async fn health() -> impl IntoResponse {
+async fn health(State(s): State<AppState>) -> impl IntoResponse {
+    let peers = s.node.connected_peers().len();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "nodeHealth": "Ready" })),
+        Json(serde_json::json!({ "nodeHealth": "Ready", "connectedPeers": peers })),
     )
 }
 
