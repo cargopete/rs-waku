@@ -300,6 +300,7 @@ enum Command {
         request: Box<FilterSubscribeRequest>,
         reply: oneshot::Sender<Result<FilterSubscribeResponse, String>>,
     },
+    Shutdown,
 }
 
 /// Handle for issuing commands to a running node.
@@ -425,6 +426,12 @@ impl NodeHandle {
         rx.await
             .map_err(|_| NodeError::NodeStopped)?
             .map_err(NodeError::Command)
+    }
+
+    /// Gracefully stop the node: the swarm task exits, closing connections and
+    /// the event stream. Subsequent commands fail with [`NodeError::NodeStopped`].
+    pub async fn shutdown(&self) {
+        let _ = self.cmd_tx.send(Command::Shutdown).await;
     }
 
     /// Ask `peer` for up to `num_peers` ENRs (34/WAKU2-PEER-EXCHANGE).
@@ -730,8 +737,8 @@ async fn run(
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
+                Some(Command::Shutdown) | None => break, // shutdown or all handles dropped
                 Some(cmd) => handle_command(&mut swarm, cmd, &mut pending),
-                None => break, // all handles dropped
             },
             event = swarm.select_next_some() => {
                 if handle_event(
@@ -838,6 +845,7 @@ fn handle_command(swarm: &mut Swarm<WakuBehaviour>, cmd: Command, pending: &mut 
                 .send_request(&peer, *request);
             pending.filter.insert(id, reply);
         }
+        Command::Shutdown => {} // handled in `run`'s select before reaching here
     }
 }
 

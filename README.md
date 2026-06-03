@@ -121,7 +121,7 @@ Each milestone is gated by an interop test against a live nwaku node (in the
 - [x] nwaku-compatible REST API (`axum`, port 8645): `debug`/`health`/`info`, relay publish + subscribe + poll cache (`/relay/v1/auto/...`), lightpush, store v3 query, `/admin/v1/peers`. Live via `wakunode --rest-port`; tested (oneshot + curl).
 - [x] Prometheus `/metrics` (connected peers, stored messages).
 - [x] DoS protection: per-peer token-bucket request rate limits on store + lightpush (`429` on excess); libp2p connection limits (max established + per-peer cap, `--max-connections`).
-- [x] Prod-readiness: persistent secp256k1 identity (`--node-key-file`, stable peer-id/ENR across restarts) and durable file-backed store (`--store-path`); both tested.
+- [x] Prod-readiness: persistent secp256k1 identity (`--node-key-file`, stable peer-id/ENR across restarts) and durable file-backed store (`--store-path`); graceful shutdown (Ctrl-C/SIGTERM → clean stop); multi-stage `Dockerfile` (non-root, `/data` volume). All tested.
 - [ ] Remaining REST endpoints (filter); ip-colocation; run the Python interop suite.
 - [ ] **Gate:** pass the full Python interop suite protocol-by-protocol.
 
@@ -184,6 +184,13 @@ For a durable, stable-identity node (survives restarts):
 ```sh
 cargo run -p wakunode -- --tcp-port 60000 --dns-discovery \
     --node-key-file ./node.key --store-path ./store.db --rest-port 8645
+```
+
+Or via Docker (joins TWN mainnet, persists identity + store under `/data`):
+
+```sh
+docker build -t rs-waku .
+docker run -p 8645:8645 -p 60000:60000 -v rs-waku-data:/data rs-waku
 ```
 
 Key flags (mirroring nwaku): `--cluster-id`, `--shard` (repeatable; empty = all

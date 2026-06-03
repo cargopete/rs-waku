@@ -228,11 +228,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Drive the event stream until Ctrl-C.
+    // A SIGTERM future (unix); a never-completing future elsewhere.
+    #[cfg(unix)]
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
+    // Drive the event stream until a shutdown signal.
     loop {
+        let terminate = async {
+            #[cfg(unix)]
+            if let Some(sig) = sigterm.as_mut() {
+                sig.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutting down");
+                tracing::info!("received Ctrl-C, shutting down");
+                node.shutdown().await;
+                break;
+            }
+            _ = terminate => {
+                tracing::info!("received SIGTERM, shutting down");
+                node.shutdown().await;
                 break;
             }
             event = events.recv() => match event {

@@ -1,0 +1,8 @@
+/target
+.git
+*.db
+*.db-*
+*.sqlite*
+node.key
+*.keystore
+.env
